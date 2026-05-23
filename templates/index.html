@@ -122,6 +122,37 @@
             33% { content: ".."; }
             66% { content: "..."; }
         }
+        #upload-section {
+            width: 90%;
+            max-width: 800px;
+            margin: 20px auto 0;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        #pdf-upload {
+            display: none;
+        }
+        #upload-label {
+            background-color: #27ae60;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background-color 0.3s;
+            white-space: nowrap;
+        }
+        #upload-label:hover {
+            background-color: #2ecc71;
+        }
+        #upload-status {
+            font-size: 13px;
+            color: #95a5a6;
+            flex-grow: 1;
+        }
+        #upload-status.success { color: #2ecc71; }
+        #upload-status.error { color: #e74c3c; }
         /* Custom Scrollbar */
         #chat-window::-webkit-scrollbar {
             width: 8px;
@@ -141,6 +172,11 @@
 </head>
 <body>
     <h2 style="text-align: center; margin-top: 40px; color: #ecf0f1; font-weight: 500;">FOOD SECURITY CHATBOT</h2>
+    <div id="upload-section">
+        <input type="file" id="pdf-upload" accept=".pdf">
+        <label for="pdf-upload" id="upload-label">+ Upload PDF</label>
+        <span id="upload-status">Upload any PDF to add it to the knowledge base</span>
+    </div>
     <div id="chat-container">
         <div id="chat-window">
             <div id="typing-indicator" class="typing-indicator">Assistant is thinking</div>
@@ -155,6 +191,34 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/popper.js/1.14.7/umd/popper.min.js"></script>
     <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.3.1/js/bootstrap.min.js"></script>
     <script>
+        // PDF upload
+        document.getElementById('pdf-upload').addEventListener('change', async function() {
+            const file = this.files[0];
+            if (!file) return;
+            const status = document.getElementById('upload-status');
+            status.textContent = `Uploading ${file.name}...`;
+            status.className = '';
+
+            const formData = new FormData();
+            formData.append('pdf', file);
+
+            try {
+                const res = await fetch('/upload', { method: 'POST', body: formData });
+                const data = await res.json();
+                if (data.error) {
+                    status.textContent = `Error: ${data.error}`;
+                    status.className = 'error';
+                } else {
+                    status.textContent = data.message;
+                    status.className = 'success';
+                }
+            } catch (e) {
+                status.textContent = 'Upload failed. Please try again.';
+                status.className = 'error';
+            }
+            this.value = '';
+        });
+
         // Handle Enter key in textarea
         document.getElementById('question').addEventListener('keypress', function(e) {
             if (e.key === 'Enter' && !e.shiftKey) {
@@ -240,7 +304,7 @@
             const chatWindow = document.getElementById('chat-window');
             const welcomeMessage = document.createElement('div');
             welcomeMessage.classList.add('chat-message', 'bot-message');
-            welcomeMessage.textContent = "Welcome to the Food Security Chatbot! How can I assist you today?";
+            welcomeMessage.textContent = "Welcome! Upload any PDF above, then ask questions about it. Powered by semantic search + Llama 3.3 70B via Groq.";
             chatWindow.appendChild(welcomeMessage);
         });
     </script>

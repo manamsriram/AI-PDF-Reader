@@ -1,0 +1,12 @@
+.env
+chroma_db/
+pdfFolder/
+chatbot.db
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+path/to/venv/
+*.egg-info/
+dist/
+build/

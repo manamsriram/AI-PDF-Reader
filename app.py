@@ -1,215 +1,301 @@
 from flask import Flask, request, jsonify, render_template
+from werkzeug.utils import secure_filename
 import sqlite3
 import redis
 import json
 import os
-import ssl
-from openai import OpenAI
 import re
+import ssl
 import pymupdf
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import logging
-import pika
 import threading
 import uuid
-from time import sleep
 from dotenv import load_dotenv
+from groq import Groq
+from sentence_transformers import SentenceTransformer, CrossEncoder
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, PayloadSchemaType
+from rank_bm25 import BM25Okapi
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# Load environment variables
 load_dotenv()
-
-# Set up basic logging
 logging.basicConfig(level=logging.INFO)
-# Disable SSL verification (only use this in development)
 ssl._create_default_https_context = ssl._create_unverified_context
 
 app = Flask(__name__, static_url_path='', static_folder='.')
 
-# Initialize OpenAI client
-client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+# LLM via Groq (free tier)
+groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
+GROQ_MODEL = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
 
-# SQLite Database setup
 DATABASE = 'chatbot.db'
 PDF_FOLDER = 'pdfFolder'
+COLLECTION = 'documents'
 
-# Initialize Redis client
+# Redis (optional — caching disabled gracefully if unavailable)
 REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
 REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
 redis_client = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, db=0)
 try:
     redis_client.ping()
-    print("Redis is connected!")
-except redis.ConnectionError:
-    print("Could not connect to Redis.")
+    logging.info("Redis connected")
+except Exception:
+    redis_client = None
+    logging.warning("Redis not available — caching disabled")
 
-# RabbitMQ setup
-RABBITMQ_HOST = os.getenv('RABBITMQ_HOST', '127.0.0.1')
-RABBITMQ_PORT = int(os.getenv('RABBITMQ_PORT', 5672))
-RABBITMQ_USER = os.getenv('RABBITMQ_USER', 'guest')
-RABBITMQ_PASS = os.getenv('RABBITMQ_PASS', 'guest')
-QUERY_QUEUE = 'query_queue'
-RESPONSE_QUEUE = 'response_queue'
+# Semantic models (CPU-friendly, ~90MB total, downloaded once)
+logging.info("Loading embedding model (all-MiniLM-L6-v2)...")
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+logging.info("Loading reranker (ms-marco-MiniLM-L-6-v2)...")
+reranker_model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
 
-# Global variables for text chunks and vectorizer
-text_chunks = []
-vectorizer = None
-chunk_embeddings = None
+# Qdrant Cloud vector store
+qdrant = QdrantClient(url=os.getenv('QDRANT_URL'), api_key=os.getenv('QDRANT_API_KEY'))
+if not qdrant.collection_exists(COLLECTION):
+    qdrant.create_collection(
+        collection_name=COLLECTION,
+        vectors_config=VectorParams(size=384, distance=Distance.COSINE)
+    )
+    qdrant.create_payload_index(
+        collection_name=COLLECTION,
+        field_name="source",
+        field_schema=PayloadSchemaType.KEYWORD
+    )
+    logging.info(f"Created Qdrant collection: {COLLECTION}")
 
-def delete_queues():
-    """Delete existing queues if they exist"""
+# Sentence-boundary-aware chunker with overlap
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=800,
+    chunk_overlap=150,
+    separators=["\n\n", "\n", ". ", " ", ""]
+)
+
+# BM25 sparse index (in-memory, rebuilt from Qdrant on startup/upload)
+bm25_index = None
+bm25_corpus = []   # list of (point_id, display_text)
+bm25_lock = threading.Lock()
+
+
+# ---- Indexing ----
+
+def rebuild_bm25():
+    global bm25_index, bm25_corpus
+    records, _ = qdrant.scroll(collection_name=COLLECTION, with_payload=True, limit=10000)
+    if not records:
+        with bm25_lock:
+            bm25_index = None
+            bm25_corpus = []
+        return
+
+    texts = [r.payload.get("text", "") for r in records]
+    ids = [str(r.id) for r in records]
+    tokenized = [t.lower().split() for t in texts]
+
+    with bm25_lock:
+        bm25_index = BM25Okapi(tokenized)
+        bm25_corpus = list(zip(ids, texts))
+    logging.info(f"BM25 rebuilt with {len(bm25_corpus)} chunks")
+
+
+def preprocess(text):
+    text = text.replace('\n', ' ')
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def pdf_to_pages(path):
     try:
-        parameters = pika.ConnectionParameters(
-            host=RABBITMQ_HOST,
-            port=RABBITMQ_PORT,
-            connection_attempts=3,
-            retry_delay=1
-        )
-        connection = pika.BlockingConnection(parameters)
-        channel = connection.channel()
-        
-        # Delete existing queues
-        channel.queue_delete(queue=QUERY_QUEUE)
-        channel.queue_delete(queue=RESPONSE_QUEUE)
-        
-        connection.close()
-        logging.info("Successfully deleted existing queues")
+        doc = pymupdf.open(path)
+        pages = []
+        for page_num in range(doc.page_count):
+            text = preprocess(doc[page_num].get_text("text"))
+            if text:
+                pages.append((page_num + 1, text))
+        doc.close()
+        return pages
     except Exception as e:
-        logging.warning(f"Error deleting queues (this is normal if queues don't exist): {e}")
+        logging.error(f"Error reading PDF {path}: {e}")
+        return []
 
-def setup_rabbitmq():
-    """Setup RabbitMQ connection with retry logic"""
-    max_retries = 3
-    retry_delay = 2  # seconds
-    
-    for attempt in range(max_retries):
-        try:
-            # Create connection parameters explicitly using IPv4
-            parameters = pika.ConnectionParameters(
-                host=RABBITMQ_HOST,
-                port=RABBITMQ_PORT,
-                connection_attempts=3,
-                retry_delay=1,
-                socket_timeout=5
+
+def index_pdf(pdf_path, force=False):
+    """Extract, chunk, embed, and upsert a PDF into Qdrant. Returns chunk count."""
+    filename = os.path.basename(pdf_path)
+
+    if not force:
+        existing, _ = qdrant.scroll(
+            collection_name=COLLECTION,
+            scroll_filter=Filter(must=[FieldCondition(key="source", match=MatchValue(value=filename))]),
+            limit=1
+        )
+        if existing:
+            logging.info(f"Already indexed: {filename}")
+            return 0
+
+    pages = pdf_to_pages(pdf_path)
+    if not pages:
+        return 0
+
+    points = []
+    embed_texts = []
+    display_texts = []
+
+    for page_num, page_text in pages:
+        chunks = text_splitter.split_text(page_text)
+        for chunk_idx, chunk in enumerate(chunks):
+            if not chunk.strip():
+                continue
+            # Deterministic UUID so re-indexing the same file is idempotent
+            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{filename}__p{page_num}__c{chunk_idx}"))
+            display_text = f"[Page {page_num}, Source: {filename}] {chunk}"
+            embed_texts.append(chunk)       # embed content only, not the prefix
+            display_texts.append(display_text)
+            points.append((point_id, filename, page_num, display_text))
+
+    if not points:
+        return 0
+
+    vecs = embedding_model.encode(embed_texts, batch_size=32, show_progress_bar=False)
+
+    qdrant.upsert(
+        collection_name=COLLECTION,
+        points=[
+            PointStruct(
+                id=point_id,
+                vector=vec.tolist(),
+                payload={"source": filename, "page": page_num, "text": display_text}
             )
-            
-            connection = pika.BlockingConnection(parameters)
-            channel = connection.channel()
-            
-            # Declare queues (non-durable for development)
-            channel.queue_declare(queue=QUERY_QUEUE)
-            channel.queue_declare(queue=RESPONSE_QUEUE)
-            
-            logging.info("Successfully connected to RabbitMQ")
-            return connection, channel
-            
-        except pika.exceptions.AMQPConnectionError as e:
-            if attempt == max_retries - 1:
-                logging.error(f"Failed to connect to RabbitMQ after {max_retries} attempts: {e}")
-                raise
-            logging.warning(f"RabbitMQ connection attempt {attempt + 1} failed. Retrying in {retry_delay} seconds...")
-            sleep(retry_delay)
+            for (point_id, filename, page_num, display_text), vec in zip(points, vecs)
+        ]
+    )
+    logging.info(f"Indexed {len(points)} chunks from {filename}")
+    return len(points)
 
-def get_rabbitmq_channel():
-    """Get a new channel with error handling"""
-    try:
-        connection, channel = setup_rabbitmq()
-        return connection, channel
-    except Exception as e:
-        logging.error(f"Failed to get RabbitMQ channel: {e}")
-        raise
 
-def publish_response(channel, correlation_id, response):
-    """Publish response to RabbitMQ response queue with error handling"""
+def init_index():
+    os.makedirs(PDF_FOLDER, exist_ok=True)
+    for fname in os.listdir(PDF_FOLDER):
+        if fname.endswith('.pdf'):
+            index_pdf(os.path.join(PDF_FOLDER, fname))
+    rebuild_bm25()
+
+
+# ---- Retrieval ----
+
+def get_collection_count():
     try:
-        channel.basic_publish(
-            exchange='',
-            routing_key=RESPONSE_QUEUE,
-            properties=pika.BasicProperties(
-                correlation_id=correlation_id
-            ),
-            body=json.dumps({'response': response})
+        return qdrant.get_collection(COLLECTION).points_count
+    except Exception:
+        return 0
+
+
+def reciprocal_rank_fusion(ranked_lists, k=60):
+    scores = {}
+    for ranked in ranked_lists:
+        for rank, doc_id in enumerate(ranked):
+            scores[doc_id] = scores.get(doc_id, 0) + 1.0 / (k + rank + 1)
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+
+def hybrid_search(query, top_k=20):
+    """Combine dense (Qdrant) and sparse (BM25) retrieval via RRF."""
+    if get_collection_count() == 0:
+        return []
+
+    # Dense retrieval via Qdrant
+    query_vec = embedding_model.encode([query])[0].tolist()
+    hits = qdrant.search(
+        collection_name=COLLECTION,
+        query_vector=query_vec,
+        limit=min(top_k, get_collection_count()),
+        with_payload=True
+    )
+    dense_ids = [str(h.id) for h in hits]
+    dense_doc_map = {str(h.id): h.payload.get("text", "") for h in hits}
+
+    # Sparse retrieval via BM25
+    with bm25_lock:
+        local_bm25 = bm25_index
+        local_corpus = list(bm25_corpus)
+
+    sparse_ids = []
+    if local_bm25 and local_corpus:
+        scores = local_bm25.get_scores(query.lower().split())
+        top_indices = np.argsort(scores)[::-1][:top_k]
+        sparse_ids = [local_corpus[i][0] for i in top_indices if scores[i] > 0]
+
+    # RRF fusion
+    fused = reciprocal_rank_fusion([dense_ids, sparse_ids])
+
+    corpus_map = {cid: text for cid, text in local_corpus}
+    corpus_map.update(dense_doc_map)
+
+    candidates = []
+    for doc_id, _ in fused[:top_k]:
+        text = corpus_map.get(doc_id)
+        if text:
+            candidates.append((doc_id, text))
+    return candidates
+
+
+def find_relevant_chunks(query, top_n=3):
+    if get_collection_count() == 0:
+        return []
+
+    candidates = hybrid_search(query, top_k=20)
+    if not candidates:
+        return []
+
+    texts = [text for _, text in candidates]
+    scores = reranker_model.predict([(query, t) for t in texts])
+    ranked = sorted(zip(scores, texts), reverse=True)
+    return [text for _, text in ranked[:top_n]]
+
+
+# ---- LLM ----
+
+def generate_text(prompt):
+    try:
+        response = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a helpful assistant that answers questions based on "
+                        "provided document excerpts. Always cite page numbers when referencing "
+                        "information. If the answer is not found in the provided context, "
+                        "say so clearly rather than guessing."
+                    )
+                },
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=750,
+            temperature=0.2
         )
-        logging.info(f"Published response for correlation_id: {correlation_id}")
+        return response.choices[0].message.content.strip()
     except Exception as e:
-        logging.error(f"Error publishing response: {e}")
-        raise
+        logging.error(f"Groq API error: {e}")
+        return f"Error generating response: {e}"
 
-def process_query(ch, method, properties, body):
-    """Process incoming queries from RabbitMQ"""
-    try:
-        query_data = json.loads(body)
-        question = query_data['question']
-        correlation_id = properties.correlation_id
-        
-        logging.info(f"Processing query with correlation_id: {correlation_id}")
-        
-        # Check Redis cache first
-        response = get_cached_response(question)
-        if response is not None:
-            logging.info("Response retrieved from Redis cache.")
-        else:
-            # Check SQLite database
-            response = get_response_from_db(question)
-            if response:
-                logging.info("Response retrieved from SQLite database.")
-            else:
-                # If not in Redis or SQLite, call OpenAI API
-                response = ask_file(question)
-                if response and response != "No relevant information found in the PDFs.":
-                    store_query_response(question, response)
-                    cache_response(question, response)
-                    logging.info("Response generated by OpenAI API and stored in Redis cache.")
-        
-        # Publish response back to RabbitMQ
-        publish_response(ch, correlation_id, response)
-        
-        # Acknowledge the message
-        ch.basic_ack(delivery_tag=method.delivery_tag)
-        
-    except Exception as e:
-        logging.error(f"Error processing query: {e}")
-        # Negative acknowledge the message to requeue it
-        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
-def start_consuming():
-    """Start consuming messages from RabbitMQ in a separate thread with reconnection logic"""
-    while True:
-        try:
-            connection, channel = setup_rabbitmq()
-            channel.basic_qos(prefetch_count=1)
-            channel.basic_consume(queue=QUERY_QUEUE, on_message_callback=process_query)
-            
-            logging.info("Starting to consume messages from RabbitMQ")
-            channel.start_consuming()
-            
-        except pika.exceptions.ConnectionClosedByBroker:
-            logging.warning("Connection was closed by broker, retrying...")
-            continue
-            
-        except pika.exceptions.AMQPChannelError as e:
-            logging.error(f"Channel error: {e}, stopping...")
-            break
-            
-        except pika.exceptions.AMQPConnectionError:
-            logging.warning("Connection was lost, retrying...")
-            continue
-            
-        except Exception as e:
-            logging.error(f"Unexpected error in consumer thread: {e}")
-            if 'connection' in locals() and connection and not connection.is_closed:
-                connection.close()
-            sleep(5)
-            continue
+def ask_file(question):
+    chunks = find_relevant_chunks(question, top_n=3)
+    if not chunks:
+        return "No documents have been indexed yet. Please upload a PDF first."
 
-# Delete existing queues before starting
-delete_queues()
+    prompt = (
+        "Based on the following excerpts from documents, answer the question. "
+        "Include page numbers when citing information. "
+        "If the answer is not in the excerpts, say so.\n\n"
+    )
+    for chunk in chunks:
+        prompt += f"{chunk}\n\n"
+    prompt += f"Question: {question}\nAnswer:"
+    return generate_text(prompt)
 
-# Start consumer thread
-consumer_thread = threading.Thread(target=start_consuming)
-consumer_thread.daemon = True
-consumer_thread.start()
+
+# ---- Database ----
 
 def init_db():
     conn = sqlite3.connect(DATABASE)
@@ -218,13 +304,15 @@ def init_db():
     conn.commit()
     conn.close()
 
+
 def get_response_from_db(query):
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
     c.execute('SELECT response FROM chat_history WHERE query = ?', (query,))
-    response = c.fetchone()
+    row = c.fetchone()
     conn.close()
-    return response[0] if response else None
+    return row[0] if row else None
+
 
 def store_query_response(query, response):
     conn = sqlite3.connect(DATABASE)
@@ -233,191 +321,81 @@ def store_query_response(query, response):
     conn.commit()
     conn.close()
 
+
 def get_cached_response(query):
-    cached_response = redis_client.get(query)
-    if cached_response:
-        return json.loads(cached_response)
-    return None
+    if not redis_client:
+        return None
+    try:
+        cached = redis_client.get(query)
+        return json.loads(cached) if cached else None
+    except Exception:
+        return None
+
 
 def cache_response(query, response, ttl=3600):
-    redis_client.setex(query, ttl, json.dumps(response))
-
-def preprocess(text):
-    text = text.replace('\n', ' ')
-    text = re.sub('\s+', ' ', text)
-    return text
-
-def pdf_to_text(path):
+    if not redis_client:
+        return
     try:
-        doc = pymupdf.open(path)
-        text_list = []
-        
-        for page_num in range(doc.page_count):
-            page = doc[page_num]
-            text = page.get_text("text")
-            text = preprocess(text)
-            if text.strip():  # Only add non-empty pages
-                text_list.append(f"[Page {page_num + 1}] {text}")
-        
-        doc.close()
-        return text_list
-    except Exception as e:
-        print(f"Error processing PDF {path}: {str(e)}")
-        return []
+        redis_client.setex(query, ttl, json.dumps(response))
+    except Exception:
+        pass
 
-def text_to_chunks(text_list, chunk_size=1000):
-    chunks = []
-    for page_text in text_list:
-        page_num = page_text[:page_text.find(']') + 1]
-        text = page_text[page_text.find(']') + 1:]
-        
-        words = text.split()
-        for i in range(0, len(words), chunk_size):
-            chunk = ' '.join(words[i:i + chunk_size])
-            if chunk.strip():
-                chunks.append(f"{page_num} {chunk}")
-    
-    return chunks
 
-def initialize_vectorizer():
-    global vectorizer, chunk_embeddings, text_chunks
-    
-    if not os.path.exists(PDF_FOLDER):
-        os.makedirs(PDF_FOLDER)
-        return "No PDFs found in the folder. Please add PDFs to the 'pdfFolder' directory."
-    
-    pdf_files = [f for f in os.listdir(PDF_FOLDER) if f.endswith('.pdf')]
-    if not pdf_files:
-        return "No PDFs found in the folder. Please add PDFs to the 'pdfFolder' directory."
-    
-    all_texts = []
-    for file in pdf_files:
-        pdf_path = os.path.join(PDF_FOLDER, file)
-        texts = pdf_to_text(str(pdf_path))
-        all_texts.extend(texts)
-    
-    if not all_texts:
-        return "Could not extract text from PDFs. Please check if the files are valid."
-    
-    text_chunks = text_to_chunks(all_texts)
-    
-    vectorizer = TfidfVectorizer()
-    chunk_embeddings = vectorizer.fit_transform(text_chunks)
-    
-    return "Vectorizer initialized successfully"
+# ---- Startup ----
 
-def find_relevant_chunks(query, top_k=5):
-    if vectorizer is None or chunk_embeddings is None:
-        initialize_vectorizer()
-    
-    query_vector = vectorizer.transform([query])
-    similarities = cosine_similarity(query_vector, chunk_embeddings)
-    top_indices = similarities[0].argsort()[-top_k:][::-1]
-    
-    return [text_chunks[i] for i in top_indices]
+init_db()
+init_index()
 
-def generate_text(prompt):
-    try:
-        full_response = ""
-        while True:
-            response = client.chat.completions.create(
-                model="gpt-4-turbo",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that answers questions based on provided document excerpts."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=750,
-                temperature=0.8
-            )
-            
-            part = response.choices[0].message.content.strip()
-            full_response += part
 
-            if response.choices[0].finish_reason == "stop":
-                break
-            
-            prompt = " ".join(part.split()[-10:]) + " Please continue."
-
-        return full_response
-    except Exception as e:
-        return str(e)
-
-def ask_file(question: str) -> str:
-    if vectorizer is None:
-        result = initialize_vectorizer()
-        if result != "Vectorizer initialized successfully":
-            return result
-    
-    relevant_chunks = find_relevant_chunks(question, top_k=3)
-    
-    if not relevant_chunks:
-        return "No relevant information found in the PDFs."
-    
-    prompt = "Based on the following excerpts from documents, please answer the question. Include page numbers when citing information.\n\n"
-    for chunk in relevant_chunks:
-        prompt += f"{chunk}\n\n"
-    prompt += f"Question: {question}\nAnswer:"
-    
-    response = generate_text(prompt)
-    return response
+# ---- Routes ----
 
 @app.route('/')
 def index():
-    init_db()
     return render_template('index.html')
+
+
+@app.route('/upload', methods=['POST'])
+def upload_pdf():
+    if 'pdf' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+
+    file = request.files['pdf']
+    if not file.filename or not file.filename.lower().endswith('.pdf'):
+        return jsonify({'error': 'Please upload a valid PDF file'}), 400
+
+    filename = secure_filename(file.filename)
+    os.makedirs(PDF_FOLDER, exist_ok=True)
+    save_path = os.path.join(PDF_FOLDER, filename)
+    file.save(save_path)
+
+    count = index_pdf(save_path, force=True)
+    rebuild_bm25()
+
+    return jsonify({'message': f'Successfully indexed {count} chunks from {filename}'})
+
 
 @app.route('/ask', methods=['POST'])
 def ask():
     try:
-        question = request.form.get('question')
-        correlation_id = str(uuid.uuid4())
-        
-        # Setup RabbitMQ connection for publishing
-        connection, channel = get_rabbitmq_channel()
-        
-        # Publish question to query queue
-        channel.basic_publish(
-            exchange='',
-            routing_key=QUERY_QUEUE,
-            properties=pika.BasicProperties(
-                correlation_id=correlation_id,
-                reply_to=RESPONSE_QUEUE
-            ),
-            body=json.dumps({'question': question})
-        )
-        
-        # Setup consumer for this specific response
-        response = None
-        def callback(ch, method, properties, body):
-            if properties.correlation_id == correlation_id:
-                nonlocal response
-                response = json.loads(body)
-                channel.stop_consuming()
-        
-        # Start consuming from response queue
-        channel.basic_consume(
-            queue=RESPONSE_QUEUE,
-            on_message_callback=callback,
-            auto_ack=True
-        )
-        
-        # Wait for response with timeout
-        try:
-            channel.start_consuming()
-        except Exception as e:
-            logging.error(f"Error while consuming response: {e}")
-            response = {'error': 'Failed to get response, please try again'}
-        
-        # Close connection
-        connection.close()
-        
-        return jsonify(response or {'error': 'No response received'})
-        
+        question = request.form.get('question', '').strip()
+        if not question:
+            return jsonify({'error': 'No question provided'}), 400
+
+        response = get_cached_response(question)
+        if response is None:
+            response = get_response_from_db(question)
+            if not response:
+                response = ask_file(question)
+                if response and "No documents" not in response:
+                    store_query_response(question, response)
+                    cache_response(question, response)
+
+        return jsonify({'response': response})
+
     except Exception as e:
-        logging.error(f"Error in ask endpoint: {e}")
+        logging.error(f"Error in /ask: {e}")
         return jsonify({'error': 'An error occurred, please try again'})
 
+
 if __name__ == '__main__':
-    init_db()
-    initialize_vectorizer()
     app.run(debug=True)

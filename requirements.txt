@@ -1,7 +1,11 @@
 Flask
+gunicorn
 redis
-json5
-openai
 pymupdf
-scikit-learn
 numpy
+python-dotenv
+groq
+sentence-transformers
+qdrant-client
+rank-bm25
+langchain-text-splitters
