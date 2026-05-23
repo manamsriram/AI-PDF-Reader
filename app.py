@@ -398,13 +398,20 @@ def upload_pdf():
 @app.route('/documents', methods=['GET'])
 def list_documents():
     try:
-        records, _ = qdrant.scroll(
-            collection_name=COLLECTION,
-            with_payload=True,
-            limit=10000
-        )
+        all_records = []
+        offset = None
+        while True:
+            batch, offset = qdrant.scroll(
+                collection_name=COLLECTION,
+                with_payload=True,
+                limit=1000,
+                offset=offset
+            )
+            all_records.extend(batch)
+            if offset is None:
+                break
         counts = {}
-        for r in records:
+        for r in all_records:
             name = r.payload.get('source', 'unknown')
             counts[name] = counts.get(name, 0) + 1
         documents = [{'filename': name, 'chunks': count}
@@ -412,7 +419,7 @@ def list_documents():
         return jsonify({'documents': documents})
     except Exception as e:
         logging.error(f"Error in /documents: {e}")
-        return jsonify({'documents': []})
+        return jsonify({'documents': []}), 500
 
 
 @app.route('/ask', methods=['POST'])
