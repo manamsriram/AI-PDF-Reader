@@ -30,6 +30,20 @@ AI-PDF-Reader lets you "chat with your documents" — ask questions, find facts,
 | ![Python](https://img.shields.io/badge/-Python-3776AB?style=flat-square&logo=python) | ![Flask](https://img.shields.io/badge/-Flask-000000?logo=flask) | ![OpenAI](https://img.shields.io/badge/-OpenAI-10A37F?logo=openai) | ![Redis](https://img.shields.io/badge/-Redis-DC382D?logo=redis) | ![RabbitMQ](https://img.shields.io/badge/-RabbitMQ-FF6600?logo=rabbitmq) | ![scikit-learn](https://img.shields.io/badge/-scikit--learn-F7931E?logo=scikit-learn) | ![NumPy](https://img.shields.io/badge/-NumPy-013243?logo=numpy) | ![PyMuPDF](https://img.shields.io/badge/-PyMuPDF-4E8B93?logo=pypi) |
 |:--:|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
 
+## Deployment
+
+The simplest production split for this repo is:
+
+1. Deploy the Flask app on Render as the backend.
+2. Deploy the frontend HTML on Vercel as a static site.
+3. Proxy the frontend requests for `/ask` and `/upload` to the Render backend.
+
+This repository includes a [`vercel.json`](vercel.json) that does that routing. Replace `https://YOUR-RENDER-BACKEND.onrender.com` with your actual Render service URL.
+
+On Render, keep the existing backend environment variables set for the Flask app, especially `GROQ_API_KEY`, `QDRANT_URL`, and `QDRANT_API_KEY`.
+
+On Vercel, no Python runtime is needed for the frontend. The app can stay as a static site because the browser still calls `/ask` and `/upload`, and Vercel rewrites those paths to Render.
+
 ---
 
 ## 🎯 Features

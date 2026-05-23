@@ -13,3 +13,4 @@ build/
 .venv
 .serena
 .superpowers
+__pycache__
