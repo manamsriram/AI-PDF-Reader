@@ -10,3 +10,5 @@ path/to/venv/
 *.egg-info/
 dist/
 build/
+.venv
+.serena
