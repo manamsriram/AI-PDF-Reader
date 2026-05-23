@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DocSense AI</title>
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <script src="/static/js/app.js"></script>
+</head>
+<body x-data="docsenseApp" x-init="init()">
+
+  <!-- Navbar -->
+  <nav class="navbar">
+    <span class="navbar-brand">DocSense AI</span>
+    <div class="navbar-spacer"></div>
+    <div class="model-badge">
+      <div class="model-dot"></div>
+      <span>Llama 3.3 70B</span>
+    </div>
+    <button class="docs-toggle" @click="toggleDocs()">
+      ☰ <span x-text="docCount"></span> Docs
+      <span x-text="docsExpanded ? '▾' : '▸'"></span>
+    </button>
+  </nav>
+
+  <!-- Collapsible docs bar -->
+  <div class="docs-bar">
+    <div class="docs-bar-summary" @click="toggleDocs()">
+      <span class="docs-bar-arrow" x-text="docsExpanded ? '▾' : '▸'"></span>
+      <span class="docs-bar-label"
+        x-text="docCount + ' document' + (docCount === 1 ? '' : 's') + ' indexed'">
+      </span>
+      <button class="btn-upload" @click.stop="triggerUpload()" :disabled="loading">
+        + Upload PDF
+      </button>
+    </div>
+
+    <div class="docs-list" x-show="docsExpanded" x-transition>
+      <template x-if="documents.length === 0">
+        <div class="docs-empty">No documents indexed yet. Upload a PDF to get started.</div>
+      </template>
+      <template x-for="doc in documents" :key="doc.filename">
+        <div class="doc-row">
+          <span>📄</span>
+          <span class="doc-row-name" x-text="doc.filename"></span>
+          <span class="doc-row-meta" x-text="doc.chunks + ' chunks'"></span>
+        </div>
+      </template>
+      <div x-show="uploadStatus"
+           class="upload-status"
+           :class="uploadStatusType"
+           x-text="uploadStatus">
+      </div>
+    </div>
+
+    <input type="file" accept=".pdf" hidden x-ref="fileInput" @change="handleUpload($event)">
+  </div>
+
+  <!-- Main content -->
+  <div class="content">
+
+    <!-- Chat panel -->
+    <div class="chat-panel">
+      <div class="messages" x-ref="messagesList">
+
+        <!-- Empty state -->
+        <template x-if="messages.length === 0 && !loading">
+          <div class="messages-empty">
+            Upload a PDF above, then ask anything about it.
+          </div>
+        </template>
+
+        <!-- Messages -->
+        <template x-for="(msg, i) in messages" :key="i">
+          <div :class="msg.role === 'user' ? 'message message-user' : 'message message-bot'">
+            <template x-if="msg.role === 'user'">
+              <span x-text="msg.text"></span>
+            </template>
+            <template x-if="msg.role === 'bot'">
+              <div x-html="msg.html"></div>
+            </template>
+          </div>
+        </template>
+
+        <!-- Typing indicator -->
+        <div class="typing-indicator" x-show="loading">
+          Thinking
+          <span class="typing-dots">
+            <span></span><span></span><span></span>
+          </span>
+        </div>
+
+      </div>
+
+      <!-- Input area -->
+      <div class="input-area">
+        <textarea
+          class="input-textarea"
+          x-model="question"
+          x-ref="textarea"
+          @keydown="handleKeydown($event)"
+          @input="autoResize($event)"
+          :disabled="loading"
+          placeholder="Ask anything about your documents…"
+          rows="1"
+        ></textarea>
+        <button
+          class="btn-ask"
+          @click="ask()"
+          :disabled="loading || !question.trim()"
+        >Ask →</button>
+      </div>
+    </div>
+
+    <!-- Sources panel -->
+    <div class="sources-panel">
+      <div class="sources-header">Sources</div>
+      <div class="sources-body">
+
+        <template x-if="sources.length === 0">
+          <div class="sources-empty">
+            Sources will appear here after your first answer.
+          </div>
+        </template>
+
+        <template x-for="(src, i) in sources" :key="i">
+          <div class="source-card">
+            <div class="source-card-header">
+              <span class="source-card-filename" x-text="src.source"></span>
+              <span class="source-card-page" x-text="'Page ' + src.page"></span>
+              <span class="source-card-score" x-text="scorePercent(src.score)"></span>
+            </div>
+            <div class="source-card-excerpt" x-text="src.text"></div>
+          </div>
+        </template>
+
+      </div>
+    </div>
+
+  </div>
+
+</body>
+</html>
