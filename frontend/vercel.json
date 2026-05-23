@@ -8,6 +8,10 @@
     {
       "source": "/upload",
       "destination": "https://ai-pdf-reader-ezm2.onrender.com/upload"
+    },
+    {
+      "source": "/documents",
+      "destination": "https://ai-pdf-reader-ezm2.onrender.com/documents"
     }
   ]
 }
