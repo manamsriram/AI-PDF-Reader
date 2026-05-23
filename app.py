@@ -286,19 +286,34 @@ def generate_text(prompt):
 
 
 def ask_file(question):
-    chunks = find_relevant_chunks(question, top_n=3)
-    if not chunks:
-        return "No documents have been indexed yet. Please upload a PDF first."
+    """Return (response_text, sources) where sources is a list of dicts."""
+    scored_chunks = find_relevant_chunks(question, top_n=3)
+    if not scored_chunks:
+        return "No documents have been indexed yet. Please upload a PDF first.", []
 
+    sources = []
     prompt = (
         "Based on the following excerpts from documents, answer the question. "
         "Include page numbers when citing information. "
         "If the answer is not in the excerpts, say so.\n\n"
     )
-    for _score, text in chunks:
+    for score, text in scored_chunks:
         prompt += f"{text}\n\n"
+        # Parse "[Page N, Source: filename] ..." prefix
+        m = re.match(r'^\[Page (\d+), Source: ([^\]]+)\]\s*(.*)', text, re.DOTALL)
+        if m:
+            sources.append({
+                'page': int(m.group(1)),
+                'source': m.group(2),
+                'text': m.group(3).strip(),
+                'score': round(score, 4),
+            })
+        else:
+            sources.append({'page': 0, 'source': 'unknown', 'text': text, 'score': round(score, 4)})
+
     prompt += f"Question: {question}\nAnswer:"
-    return generate_text(prompt)
+    response = generate_text(prompt)
+    return response, sources
 
 
 # ---- Database ----
@@ -387,16 +402,17 @@ def ask():
         if not question:
             return jsonify({'error': 'No question provided'}), 400
 
+        sources = []
         response = get_cached_response(question)
         if response is None:
             response = get_response_from_db(question)
             if not response:
-                response = ask_file(question)
+                response, sources = ask_file(question)
                 if response and "No documents" not in response:
                     store_query_response(question, response)
                     cache_response(question, response)
 
-        return jsonify({'response': response})
+        return jsonify({'response': response, 'sources': sources})
 
     except Exception as e:
         logging.error(f"Error in /ask: {e}")
