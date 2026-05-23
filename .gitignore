@@ -14,3 +14,4 @@ build/
 .serena
 .superpowers
 __pycache__
+.DS_Store
