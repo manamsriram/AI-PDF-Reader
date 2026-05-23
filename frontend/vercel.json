@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "rewrites": [
+    {
+      "source": "/ask",
+      "destination": "https://ai-pdf-reader-ezm2.onrender.com/ask"
+    },
+    {
+      "source": "/upload",
+      "destination": "https://ai-pdf-reader-ezm2.onrender.com/upload"
+    }
+  ]
+}

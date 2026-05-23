@@ -395,6 +395,26 @@ def upload_pdf():
     return jsonify({'message': f'Successfully indexed {count} chunks from {filename}'})
 
 
+@app.route('/documents', methods=['GET'])
+def list_documents():
+    try:
+        records, _ = qdrant.scroll(
+            collection_name=COLLECTION,
+            with_payload=True,
+            limit=10000
+        )
+        counts = {}
+        for r in records:
+            name = r.payload.get('source', 'unknown')
+            counts[name] = counts.get(name, 0) + 1
+        documents = [{'filename': name, 'chunks': count}
+                     for name, count in sorted(counts.items())]
+        return jsonify({'documents': documents})
+    except Exception as e:
+        logging.error(f"Error in /documents: {e}")
+        return jsonify({'documents': []})
+
+
 @app.route('/ask', methods=['POST'])
 def ask():
     try:

@@ -35,14 +35,16 @@ AI-PDF-Reader lets you "chat with your documents" — ask questions, find facts,
 The simplest production split for this repo is:
 
 1. Deploy the Flask app on Render as the backend.
-2. Deploy the frontend HTML on Vercel as a static site.
+2. Deploy only the `templates/` folder on Vercel as a static frontend.
 3. Proxy the frontend requests for `/ask` and `/upload` to the Render backend.
 
-This repository includes a [`vercel.json`](vercel.json) that does that routing. Replace `https://YOUR-RENDER-BACKEND.onrender.com` with your actual Render service URL.
+Set the Vercel project root directory to `templates/`. That keeps Vercel from seeing the backend `requirements.txt` at the repo root, so it only deploys the static frontend.
+
+This repository includes a [`templates/vercel.json`](templates/vercel.json) that does the routing. Replace `https://ai-pdf-reader-ezm2.onrender.com` with your actual Render service URL.
 
 On Render, keep the existing backend environment variables set for the Flask app, especially `GROQ_API_KEY`, `QDRANT_URL`, and `QDRANT_API_KEY`.
 
-On Vercel, no Python runtime is needed for the frontend. The app can stay as a static site because the browser still calls `/ask` and `/upload`, and Vercel rewrites those paths to Render.
+On Vercel, no Python runtime is needed for the frontend. There is no separate frontend requirements file here because the HTML page is static and only uses browser-side JavaScript.
 
 ---
 

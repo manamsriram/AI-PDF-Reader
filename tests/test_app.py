@@ -52,3 +52,34 @@ def test_ask_cached_response_has_empty_sources():
         data = res.get_json()
         assert data['response'] == 'Cached answer'
         assert data['sources'] == []
+
+
+def test_documents_returns_grouped_list():
+    mock_records = [
+        MagicMock(payload={'source': 'alpha.pdf'}),
+        MagicMock(payload={'source': 'alpha.pdf'}),
+        MagicMock(payload={'source': 'beta.pdf'}),
+    ]
+    with patch('app.qdrant') as mock_qdrant:
+        mock_qdrant.scroll.return_value = (mock_records, None)
+        import app as flask_app
+        flask_app.app.config['TESTING'] = True
+        client = flask_app.app.test_client()
+        res = client.get('/documents')
+        data = res.get_json()
+        assert res.status_code == 200
+        assert 'documents' in data
+        by_name = {d['filename']: d for d in data['documents']}
+        assert by_name['alpha.pdf']['chunks'] == 2
+        assert by_name['beta.pdf']['chunks'] == 1
+
+
+def test_documents_empty_collection():
+    with patch('app.qdrant') as mock_qdrant:
+        mock_qdrant.scroll.return_value = ([], None)
+        import app as flask_app
+        flask_app.app.config['TESTING'] = True
+        client = flask_app.app.test_client()
+        res = client.get('/documents')
+        data = res.get_json()
+        assert data['documents'] == []
