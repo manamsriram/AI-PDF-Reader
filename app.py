@@ -244,7 +244,7 @@ def _sigmoid(x):
 
 
 def find_relevant_chunks(query, top_n=3):
-    """Return [(score, text), ...] where score is sigmoid-normalized reranker score."""
+    """Return [(score, text), ...] where score is a float in (0, 1), sigmoid-normalized from raw reranker logit."""
     if get_collection_count() == 0:
         return []
 
