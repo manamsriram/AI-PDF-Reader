@@ -3,6 +3,7 @@ from werkzeug.utils import secure_filename
 import sqlite3
 import redis
 import json
+import math
 import os
 import re
 import ssl
@@ -238,7 +239,12 @@ def hybrid_search(query, top_k=20):
     return candidates
 
 
+def _sigmoid(x):
+    return 1.0 / (1.0 + math.exp(-x))
+
+
 def find_relevant_chunks(query, top_n=3):
+    """Return [(score, text), ...] where score is sigmoid-normalized reranker score."""
     if get_collection_count() == 0:
         return []
 
@@ -247,9 +253,9 @@ def find_relevant_chunks(query, top_n=3):
         return []
 
     texts = [text for _, text in candidates]
-    scores = reranker_model.predict([(query, t) for t in texts])
-    ranked = sorted(zip(scores, texts), reverse=True)
-    return [text for _, text in ranked[:top_n]]
+    raw_scores = reranker_model.predict([(query, t) for t in texts])
+    ranked = sorted(zip(raw_scores, texts), reverse=True)
+    return [(_sigmoid(float(score)), text) for score, text in ranked[:top_n]]
 
 
 # ---- LLM ----
@@ -289,8 +295,8 @@ def ask_file(question):
         "Include page numbers when citing information. "
         "If the answer is not in the excerpts, say so.\n\n"
     )
-    for chunk in chunks:
-        prompt += f"{chunk}\n\n"
+    for _score, text in chunks:
+        prompt += f"{text}\n\n"
     prompt += f"Question: {question}\nAnswer:"
     return generate_text(prompt)
 
