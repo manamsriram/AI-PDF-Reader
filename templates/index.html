@@ -48,11 +48,12 @@
           <span class="doc-row-meta" x-text="doc.chunks + ' chunks'"></span>
         </div>
       </template>
-      <div x-show="uploadStatus"
-           class="upload-status"
-           :class="uploadStatusType"
-           x-text="uploadStatus">
-      </div>
+    </div>
+
+    <div x-show="uploadStatus"
+         class="upload-status"
+         :class="uploadStatusType"
+         x-text="uploadStatus">
     </div>
 
     <input type="file" accept=".pdf" hidden x-ref="fileInput" @change="handleUpload($event)">
