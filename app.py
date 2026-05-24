@@ -59,7 +59,7 @@ reranker_model = TextCrossEncoder(
 )
 
 # Qdrant Cloud vector store
-qdrant = QdrantClient(url=os.getenv('QDRANT_URL'), api_key=os.getenv('QDRANT_API_KEY'))
+qdrant = QdrantClient(url=os.getenv('QDRANT_URL'), api_key=os.getenv('QDRANT_API_KEY'), check_version=False)
 if not qdrant.collection_exists(COLLECTION):
     qdrant.create_collection(
         collection_name=COLLECTION,
@@ -469,7 +469,7 @@ def ask():
         return jsonify({'response': response, 'sources': sources})
 
     except Exception as e:
-        logging.error(f"Error in /ask: {e}")
+        logging.error(f"Error in /ask: {e}", exc_info=True)
         return jsonify({'error': 'An error occurred, please try again'})
 
 

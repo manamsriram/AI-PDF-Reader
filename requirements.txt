@@ -5,6 +5,6 @@ pymupdf==1.25.5
 python-dotenv==1.1.0
 groq==0.13.0
 fastembed==0.8.0
-qdrant-client==1.13.3
+qdrant-client>=1.17.0,<2.0
 rank-bm25==0.2.2
 langchain-text-splitters==0.3.8
