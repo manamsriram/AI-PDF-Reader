@@ -59,7 +59,7 @@ reranker_model = TextCrossEncoder(
 )
 
 # Qdrant Cloud vector store
-qdrant = QdrantClient(url=os.getenv('QDRANT_URL'), api_key=os.getenv('QDRANT_API_KEY'), check_version=False)
+qdrant = QdrantClient(url=os.getenv('QDRANT_URL'), api_key=os.getenv('QDRANT_API_KEY'))
 if not qdrant.collection_exists(COLLECTION):
     qdrant.create_collection(
         collection_name=COLLECTION,
