@@ -1,0 +1,8 @@
+pdfFolder/*.pdf
+chatbot.db
+.env
+__pycache__/
+**/__pycache__/
+.git/
+tests/
+*.pyc

@@ -14,7 +14,8 @@ import threading
 import uuid
 from dotenv import load_dotenv
 from groq import Groq
-from sentence_transformers import SentenceTransformer, CrossEncoder
+from fastembed import TextEmbedding
+from fastembed.rerank.cross_encoder import TextCrossEncoder
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, PayloadSchemaType
 from rank_bm25 import BM25Okapi
@@ -45,11 +46,17 @@ except Exception:
     redis_client = None
     logging.warning("Redis not available — caching disabled")
 
-# Semantic models (CPU-friendly, ~90MB total, downloaded once)
-logging.info("Loading embedding model (all-MiniLM-L6-v2)...")
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-logging.info("Loading reranker (ms-marco-MiniLM-L-6-v2)...")
-reranker_model = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+# Semantic models via fastembed (ONNX, no PyTorch) — reads from baked-in /model-cache
+logging.info("Loading embedding model via fastembed...")
+embedding_model = TextEmbedding(
+    model_name='sentence-transformers/all-MiniLM-L6-v2',
+    cache_dir=os.getenv('FASTEMBED_CACHE_PATH', None)
+)
+logging.info("Loading reranker via fastembed...")
+reranker_model = TextCrossEncoder(
+    model_name='Xenova/ms-marco-MiniLM-L-6-v2',
+    cache_dir=os.getenv('FASTEMBED_CACHE_PATH', None)
+)
 
 # Qdrant Cloud vector store
 qdrant = QdrantClient(url=os.getenv('QDRANT_URL'), api_key=os.getenv('QDRANT_API_KEY'))
@@ -76,6 +83,7 @@ text_splitter = RecursiveCharacterTextSplitter(
 bm25_index = None
 bm25_corpus = []   # list of (point_id, display_text)
 bm25_lock = threading.Lock()
+_bm25_ready = False
 
 
 # ---- Indexing ----
@@ -156,7 +164,7 @@ def index_pdf(pdf_path, force=False):
     if not points:
         return 0
 
-    vecs = embedding_model.encode(embed_texts, batch_size=32, show_progress_bar=False)
+    vecs = list(embedding_model.embed(embed_texts))
 
     qdrant.upsert(
         collection_name=COLLECTION,
@@ -174,11 +182,14 @@ def index_pdf(pdf_path, force=False):
 
 
 def init_index():
+    global _bm25_ready
     os.makedirs(PDF_FOLDER, exist_ok=True)
     for fname in os.listdir(PDF_FOLDER):
         if fname.endswith('.pdf'):
             index_pdf(os.path.join(PDF_FOLDER, fname))
     rebuild_bm25()
+    _bm25_ready = True
+    logging.info("Startup init complete.")
 
 
 # ---- Retrieval ----
@@ -204,7 +215,7 @@ def hybrid_search(query, top_k=20):
         return []
 
     # Dense retrieval via Qdrant
-    query_vec = embedding_model.encode([query])[0].tolist()
+    query_vec = list(embedding_model.embed([query]))[0].tolist()
     hits = qdrant.search(
         collection_name=COLLECTION,
         query_vector=query_vec,
@@ -253,9 +264,9 @@ def find_relevant_chunks(query, top_n=3):
         return []
 
     texts = [text for _, text in candidates]
-    raw_scores = reranker_model.predict([(query, t) for t in texts])
-    ranked = sorted(zip(raw_scores, texts), reverse=True)
-    return [(_sigmoid(float(score)), text) for score, text in ranked[:top_n]]
+    rerank_results = list(reranker_model.rerank(query, texts))
+    ranked = sorted(rerank_results, key=lambda r: r.score, reverse=True)
+    return [(_sigmoid(float(r.score)), texts[r.index]) for r in ranked[:top_n]]
 
 
 # ---- LLM ----
@@ -365,7 +376,7 @@ def cache_response(query, response, ttl=3600):
 # ---- Startup ----
 
 init_db()
-init_index()
+threading.Thread(target=init_index, daemon=True).start()
 
 
 # ---- Routes ----
@@ -420,6 +431,22 @@ def list_documents():
     except Exception as e:
         logging.error(f"Error in /documents: {e}")
         return jsonify({'documents': []}), 500
+
+
+@app.route('/health')
+def health():
+    qdrant_ok = False
+    try:
+        qdrant.get_collections()
+        qdrant_ok = True
+    except Exception as e:
+        logging.warning(f"Qdrant health check failed: {e}")
+    status = {
+        'status': 'ok' if (qdrant_ok and _bm25_ready) else 'starting',
+        'qdrant_ok': qdrant_ok,
+        'bm25_ready': _bm25_ready,
+    }
+    return jsonify(status), 200
 
 
 @app.route('/ask', methods=['POST'])

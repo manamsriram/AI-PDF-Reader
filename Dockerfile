@@ -1,20 +1,39 @@
-FROM python:3.11-slim
+# ---- Stage 1: builder ----
+FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
-# System deps required by pymupdf
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
 
+# Pre-download models at build time so cold starts need no internet access.
+# PYTHONPATH needed because packages were installed to /install, not the default site-packages.
+RUN PYTHONPATH=/install/lib/python3.11/site-packages python -c "\
+from fastembed import TextEmbedding; \
+from fastembed.rerank.cross_encoder import TextCrossEncoder; \
+TextEmbedding(model_name='sentence-transformers/all-MiniLM-L6-v2', cache_dir='/model-cache'); \
+TextCrossEncoder(model_name='Xenova/ms-marco-MiniLM-L-6-v2', cache_dir='/model-cache'); \
+print('Models pre-downloaded.') \
+"
+
+# ---- Stage 2: runtime ----
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY --from=builder /install /usr/local
+COPY --from=builder /model-cache /model-cache
 COPY . .
 
 RUN mkdir -p pdfFolder
 
+ENV FASTEMBED_CACHE_PATH=/model-cache
+
 EXPOSE 10000
 
-# Single worker — BM25 and ML models live in process memory
+# Single worker — ML models and BM25 index live in process memory
 CMD ["gunicorn", "--bind", "0.0.0.0:10000", "--workers", "1", "--timeout", "120", "app:app"]
