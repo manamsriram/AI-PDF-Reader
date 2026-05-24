@@ -46,17 +46,34 @@ except Exception:
     redis_client = None
     logging.warning("Redis not available — caching disabled")
 
-# Semantic models via fastembed (ONNX, no PyTorch) — reads from baked-in /model-cache
-logging.info("Loading embedding model via fastembed...")
-embedding_model = TextEmbedding(
-    model_name='sentence-transformers/all-MiniLM-L6-v2',
-    cache_dir=os.getenv('FASTEMBED_CACHE_PATH', None)
-)
-logging.info("Loading reranker via fastembed...")
-reranker_model = TextCrossEncoder(
-    model_name='Xenova/ms-marco-MiniLM-L-6-v2',
-    cache_dir=os.getenv('FASTEMBED_CACHE_PATH', None)
-)
+# Semantic models — loaded lazily on first use to reduce startup memory
+_embedding_model = None
+_reranker_model = None
+_model_lock = threading.Lock()
+
+def get_embedding_model():
+    global _embedding_model
+    if _embedding_model is None:
+        with _model_lock:
+            if _embedding_model is None:
+                logging.info("Loading embedding model via fastembed...")
+                _embedding_model = TextEmbedding(
+                    model_name='sentence-transformers/all-MiniLM-L6-v2',
+                    cache_dir=os.getenv('FASTEMBED_CACHE_PATH', None)
+                )
+    return _embedding_model
+
+def get_reranker_model():
+    global _reranker_model
+    if _reranker_model is None:
+        with _model_lock:
+            if _reranker_model is None:
+                logging.info("Loading reranker via fastembed...")
+                _reranker_model = TextCrossEncoder(
+                    model_name='Xenova/ms-marco-MiniLM-L-6-v2',
+                    cache_dir=os.getenv('FASTEMBED_CACHE_PATH', None)
+                )
+    return _reranker_model
 
 # Qdrant Cloud vector store
 qdrant = QdrantClient(url=os.getenv('QDRANT_URL'), api_key=os.getenv('QDRANT_API_KEY'))
@@ -164,7 +181,7 @@ def index_pdf(pdf_path, force=False):
     if not points:
         return 0
 
-    vecs = list(embedding_model.embed(embed_texts))
+    vecs = list(get_embedding_model().embed(embed_texts))
 
     qdrant.upsert(
         collection_name=COLLECTION,
@@ -215,7 +232,7 @@ def hybrid_search(query, top_k=20):
         return []
 
     # Dense retrieval via Qdrant
-    query_vec = list(embedding_model.embed([query]))[0].tolist()
+    query_vec = list(get_embedding_model().embed([query]))[0].tolist()
     hits = qdrant.search(
         collection_name=COLLECTION,
         query_vector=query_vec,
@@ -264,9 +281,9 @@ def find_relevant_chunks(query, top_n=3):
         return []
 
     texts = [text for _, text in candidates]
-    rerank_results = list(reranker_model.rerank(query, texts))
-    ranked = sorted(rerank_results, key=lambda r: r.score, reverse=True)
-    return [(_sigmoid(float(r.score)), texts[r.index]) for r in ranked[:top_n]]
+    scores = list(get_reranker_model().rerank(query, texts))
+    ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
+    return [(_sigmoid(float(score)), texts[i]) for i, score in ranked[:top_n]]
 
 
 # ---- LLM ----
