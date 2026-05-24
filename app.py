@@ -196,7 +196,7 @@ def init_index():
 
 def get_collection_count():
     try:
-        return qdrant.get_collection(COLLECTION).points_count
+        return qdrant.count(collection_name=COLLECTION).count
     except Exception:
         return 0
 
