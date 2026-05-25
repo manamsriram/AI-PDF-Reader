@@ -281,9 +281,9 @@ def find_relevant_chunks(query, top_n=3):
         return []
 
     texts = [text for _, text in candidates]
-    scores = list(get_reranker_model().rerank(query, texts))
-    ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
-    return [(_sigmoid(float(score)), texts[i]) for i, score in ranked[:top_n]]
+    results = list(get_reranker_model().rerank(query, texts))
+    ranked = sorted(results, key=lambda r: r.score, reverse=True)
+    return [(_sigmoid(float(r.score)), texts[r.index]) for r in ranked[:top_n]]
 
 
 # ---- LLM ----
