@@ -118,15 +118,21 @@
 
     <!-- History sidebar -->
     <div class="history-sidebar" :class="{ open: sidebarOpen }">
-      <div class="history-header">History</div>
+      <div class="history-header">
+        <span>History</span>
+        <button class="new-chat-btn" @click="newChat()" title="Start new chat">+ New Chat</button>
+      </div>
       <div class="history-body">
         <template x-if="history.length === 0">
-          <div class="history-empty">No queries yet.</div>
+          <div class="history-empty">No conversations yet.</div>
         </template>
-        <template x-for="(item, i) in history" :key="item.id">
-          <div class="history-item" @click="loadHistoryItem(item)">
-            <div class="history-item-question" x-text="item.question"></div>
-            <div class="history-item-date" x-text="formatDate(item.created_at)"></div>
+        <template x-for="session in history" :key="session.session_id">
+          <div class="history-item" @click="loadHistoryItem(session)">
+            <div class="history-item-question" x-text="session.questions[0]?.question || 'Untitled conversation'"></div>
+            <div class="history-item-meta">
+              <span class="history-item-date" x-text="formatDate(session.started_at)"></span>
+              <span class="history-item-count" x-show="session.questions.length > 1" x-text="session.questions.length + ' questions'"></span>
+            </div>
           </div>
         </template>
       </div>

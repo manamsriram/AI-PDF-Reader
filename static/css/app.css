@@ -588,7 +588,7 @@ body {
 .history-sidebar.open { width: 260px; }
 
 .history-header {
-  padding: 12px 16px;
+  padding: 10px 16px;
   border-bottom: 1px solid var(--border);
   font-size: 11px;
   font-weight: 600;
@@ -597,6 +597,30 @@ body {
   color: var(--text-secondary);
   flex-shrink: 0;
   white-space: nowrap;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.new-chat-btn {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 5px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  text-transform: none;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
+.new-chat-btn:hover {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
 }
 
 .history-body {
@@ -630,10 +654,26 @@ body {
   white-space: nowrap;
 }
 
+.history-item-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+}
+
 .history-item-date {
   font-size: 11px;
   color: var(--text-secondary);
-  margin-top: 2px;
+  white-space: nowrap;
+}
+
+.history-item-count {
+  font-size: 10px;
+  color: var(--text-secondary);
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0 5px;
   white-space: nowrap;
 }
 

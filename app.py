@@ -392,14 +392,17 @@ _SYSTEM_PROMPT = (
 )
 
 
-def generate_text(prompt):
+def generate_text(prompt, conversation_history=None):
+    messages = [{'role': 'system', 'content': _SYSTEM_PROMPT}]
+    for turn in (conversation_history or []):
+        messages.append({'role': 'user', 'content': turn['question']})
+        messages.append({'role': 'assistant', 'content': turn['answer']})
+    messages.append({'role': 'user', 'content': prompt})
+
     try:
         response = groq_client.chat.completions.create(
             model=GROQ_MODEL,
-            messages=[
-                {'role': 'system', 'content': _SYSTEM_PROMPT},
-                {'role': 'user', 'content': prompt}
-            ],
+            messages=messages,
             max_tokens=750,
             temperature=0.2
         )
@@ -412,14 +415,19 @@ def generate_text(prompt):
         return None
     try:
         model = genai.GenerativeModel(model_name=GEMINI_MODEL, system_instruction=_SYSTEM_PROMPT)
-        response = model.generate_content(prompt)
+        # Gemini uses a different multi-turn format
+        chat = model.start_chat(history=[
+            {'role': 'user' if i % 2 == 0 else 'model', 'parts': [m['content']]}
+            for i, m in enumerate(messages[1:-1])  # skip system + last user turn
+        ])
+        response = chat.send_message(prompt)
         return response.text.strip()
     except Exception as e:
         logging.error(f"Gemini fallback also failed: {e}", exc_info=True)
         return None
 
 
-def ask_file(question, user_id):
+def ask_file(question, user_id, conversation_history=None):
     """Return (response_text, sources) for a specific user's documents."""
     scored_chunks = find_relevant_chunks(question, user_id, top_n=3)
     if not scored_chunks:
@@ -445,7 +453,7 @@ def ask_file(question, user_id):
             sources.append({'page': 0, 'source': 'unknown', 'text': text, 'score': round(score, 4)})
 
     prompt += f"Question: {question}\nAnswer:"
-    response = generate_text(prompt)
+    response = generate_text(prompt, conversation_history=conversation_history)
     if response is None:
         return None, []
     return response, sources
@@ -569,16 +577,27 @@ def history():
     try:
         res = (
             supabase_admin.table('query_history')
-            .select('id,question,answer,sources,created_at')
+            .select('id,question,answer,sources,created_at,session_id')
             .eq('user_id', g.user_id)
-            .order('created_at', desc=True)
-            .limit(50)
+            .order('created_at', desc=False)
+            .limit(200)
             .execute()
         )
-        return jsonify({'history': res.data})
+        # Group by session_id; legacy rows (no session_id) each become their own session
+        sessions_map = {}
+        session_order = []
+        for row in res.data:
+            sid = row.get('session_id') or row['id']
+            if sid not in sessions_map:
+                sessions_map[sid] = {'session_id': sid, 'started_at': row['created_at'], 'questions': []}
+                session_order.append(sid)
+            sessions_map[sid]['questions'].append(row)
+        # Most recent session first
+        sessions = [sessions_map[sid] for sid in reversed(session_order)]
+        return jsonify({'sessions': sessions})
     except Exception as e:
         logging.error(f"Error in /history: {e}")
-        return jsonify({'history': []}), 500
+        return jsonify({'sessions': []}), 500
 
 
 @app.route('/health')
@@ -602,23 +621,50 @@ def health():
 def ask():
     try:
         question = request.form.get('question', '').strip()
+        session_id = request.form.get('session_id', '').strip() or None
         if not question:
             return jsonify({'error': 'No question provided'}), 400
 
         user_id = g.user_id
-        cache_key = f"{user_id}:{question}"
 
-        response, sources = get_cached_response(cache_key)
+        # Fetch prior turns for this session (for multi-turn context)
+        conversation_history = []
+        if session_id:
+            try:
+                prior = (
+                    supabase_admin.table('query_history')
+                    .select('question,answer')
+                    .eq('user_id', user_id)
+                    .eq('session_id', session_id)
+                    .order('created_at', desc=False)
+                    .limit(5)
+                    .execute()
+                )
+                conversation_history = prior.data or []
+            except Exception as e:
+                logging.warning(f"Failed to fetch session history: {e}")
+
+        # Only use Redis cache for single-turn (no prior context)
+        cache_key = f"{user_id}:{question}" if not conversation_history else None
+        response, sources = get_cached_response(cache_key) if cache_key else (None, None)
+        from_cache = response is not None
+
         if response is None:
-            response, sources = ask_file(question, user_id)
-            if response is not None and 'No documents' not in response:
+            response, sources = ask_file(question, user_id, conversation_history=conversation_history)
+
+        if response is not None and 'No documents' not in response:
+            if not from_cache and cache_key:
                 cache_response(cache_key, response, sources)
+            # Always save to history when a session is active so subsequent
+            # turns can fetch this turn as context.
+            if session_id or not from_cache:
                 try:
                     supabase_admin.table('query_history').insert({
                         'user_id': user_id,
                         'question': question,
                         'answer': response,
-                        'sources': sources
+                        'sources': sources,
+                        'session_id': session_id,
                     }).execute()
                 except Exception as e:
                     logging.warning(f"Failed to save query history: {e}")

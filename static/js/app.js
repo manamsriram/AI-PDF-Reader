@@ -32,6 +32,7 @@ document.addEventListener('alpine:init', () => {
     uploadStatus: '',
     uploadStatusType: '',
     sidebarOpen: true,
+    currentSessionId: crypto.randomUUID(),
 
     async init() {
       if (!this.authToken && _supabase && window.location.hash.includes('access_token')) {
@@ -52,7 +53,7 @@ document.addEventListener('alpine:init', () => {
           return;
         }
         const data = await res.json();
-        this.history = data.history || [];
+        this.history = data.sessions || [];
       } catch (e) {
         console.error('Init check failed:', e);
       }
@@ -121,6 +122,13 @@ document.addEventListener('alpine:init', () => {
       this.documents = [];
       this.history = [];
       this.question = '';
+      this.currentSessionId = crypto.randomUUID();
+    },
+
+    newChat() {
+      this.messages = [];
+      this.sources = [];
+      this.currentSessionId = crypto.randomUUID();
     },
 
     async loadHistory() {
@@ -128,18 +136,20 @@ document.addEventListener('alpine:init', () => {
         const res = await fetch('/history', { headers: this.authHeaders() });
         if (!res.ok) return;
         const data = await res.json();
-        this.history = data.history || [];
+        this.history = data.sessions || [];
       } catch (e) {
         console.error('Failed to load history:', e);
       }
     },
 
-    loadHistoryItem(item) {
-      this.messages = [
-        { role: 'user', text: item.question },
-        { role: 'bot', text: item.answer, html: marked.parse(item.answer) },
-      ];
-      this.sources = item.sources || [];
+    loadHistoryItem(session) {
+      this.messages = [];
+      for (const item of session.questions) {
+        this.messages.push({ role: 'user', text: item.question });
+        this.messages.push({ role: 'bot', text: item.answer, html: marked.parse(item.answer) });
+      }
+      this.sources = session.questions.at(-1)?.sources || [];
+      this.currentSessionId = session.session_id;
       this.$nextTick(() => this._scrollToBottom());
     },
 
@@ -225,7 +235,7 @@ document.addEventListener('alpine:init', () => {
         const res = await fetch('/ask', {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...this.authHeaders() },
-          body: 'question=' + encodeURIComponent(q),
+          body: 'question=' + encodeURIComponent(q) + '&session_id=' + encodeURIComponent(this.currentSessionId),
         });
 
         if (!res.ok) throw new Error('Network error');
