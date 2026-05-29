@@ -1,54 +1,76 @@
-# DocSense AI
+<div align="center">
 
-A Flask-based RAG app for chatting with PDF documents.
+# AI PDF Reader
 
-DocSense AI indexes PDF content into a vector database, combines dense + sparse retrieval, reranks relevant chunks, and generates grounded answers with citations.
+A document intelligence platform for querying PDF content using natural language, with citations and source-grounded answers.
 
-## Current Stack
+![Python](https://img.shields.io/badge/Python-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![Flask](https://img.shields.io/badge/Flask-000000?style=for-the-badge&logo=flask&logoColor=white)
+![Alpine.js](https://img.shields.io/badge/Alpine.js-8BC0D0?style=for-the-badge&logo=alpinedotjs&logoColor=white)
+![Supabase](https://img.shields.io/badge/Supabase-3ECF8E?style=for-the-badge&logo=supabase&logoColor=white)
+![Qdrant](https://img.shields.io/badge/Qdrant-FF4D4D?style=for-the-badge&logoColor=white)
+![Redis](https://img.shields.io/badge/Redis-DC382D?style=for-the-badge&logo=redis&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)
+![Vercel](https://img.shields.io/badge/Vercel-000000?style=for-the-badge&logo=vercel&logoColor=white)
+![Render](https://img.shields.io/badge/Render-46E3B7?style=for-the-badge&logo=render&logoColor=white)
+![GitHub Actions](https://img.shields.io/badge/GitHub_Actions-2088FF?style=for-the-badge&logo=githubactions&logoColor=white)
 
-- **Backend:** Flask
-- **LLM:** Groq API (`GROQ_MODEL`, default: `llama-3.3-70b-versatile`)
-- **Vector DB:** Qdrant Cloud (`documents` collection)
-- **Embeddings:** `sentence-transformers/all-MiniLM-L6-v2`
-- **Reranker:** `cross-encoder/ms-marco-MiniLM-L-6-v2`
-- **Sparse retrieval:** BM25 (`rank-bm25`)
-- **PDF parsing:** PyMuPDF
-- **Caching / storage:** Redis (optional) + SQLite (`chatbot.db`)
-- **Frontend:** Server-rendered template + static JS/CSS (Alpine.js)
+[Live Demo](https://ai-pdf-reader-ezm2.onrender.com) · [Report Bug](https://github.com/manamsriram/AI-PDF-Reader/issues) · [Request Feature](https://github.com/manamsriram/AI-PDF-Reader/issues)
+
+</div>
+
+---
+
+## Overview
+
+AI PDF Reader lets users upload PDF documents and query them using natural language. It combines dense vector search (FastEmbed), sparse BM25 retrieval, and cross-encoder reranking to surface the most relevant content, then passes it to Groq's Llama 3.3 70B (with Gemini 2.0 Flash as fallback) to generate grounded answers with page-level citations. An agentic RAG pipeline handles complex, multi-part questions by decomposing them and running a Corrective RAG loop before synthesis.
 
 ## Features
 
-- Upload and index PDFs via `/upload`
-- Automatic page-aware chunking with overlap
-- Hybrid retrieval (Qdrant dense search + BM25 sparse search via RRF)
-- Cross-encoder reranking for final context selection
-- Answers with source snippets, file names, pages, and confidence scores
-- Redis + SQLite response reuse to reduce repeat latency
-- Indexed document list endpoint (`/documents`)
+- **Agentic RAG** — Query decomposition breaks complex questions into sub-queries; a CRAG loop grades retrieved chunks and reformulates the query when relevance is low before final synthesis.
+- **Hybrid Retrieval** — Dense search via FastEmbed and sparse BM25 are fused with Reciprocal Rank Fusion (RRF), then reranked by a cross-encoder for highest-precision context selection.
+- **Two-Tier Caching** — L1 in-memory TTLCache for hot responses; L2 Redis (Upstash) for distributed persistence; SQLite as a fallback when Redis is unavailable.
+- **Multi-Turn Sessions** — Conversation history is stored in Supabase and forwarded to the LLM on each turn, enabling coherent follow-up questions across a session.
+- **Source Citations** — Every answer includes chunk snippets, source file names, page numbers, and sigmoid-normalized confidence scores.
+- **Supabase Auth** — JWT-based authentication protects all API endpoints; per-user document isolation at the vector and history layer.
+- **LLM Redundancy** — Groq (primary) with automatic Gemini 2.0 Flash fallback ensures availability when one provider is degraded.
+- **CI Pipeline** — GitHub Actions runs the pytest suite on every push.
 
-## Repository Layout
+## Tech Stack
 
-- `/app.py` – Flask app, indexing, retrieval, LLM calls, and API routes
-- `/templates/index.html` – main web UI
-- `/static/js/app.js` – frontend behavior (upload, ask, sources, documents)
-- `/static/css/app.css` – styling
-- `/pdfFolder` – uploaded PDFs
-- `/tests/test_app.py` – pytest tests
-- `/vercel.json` – rewrite rules for frontend-to-backend API proxying
-- `/Dockerfile` – containerized deployment
+| Layer | Technology |
+|-------|-----------|
+| Backend | Python, Flask, Gunicorn |
+| Frontend | Alpine.js, server-rendered Jinja2 templates |
+| Vector Database | Qdrant Cloud |
+| Embeddings | FastEmbed (`all-MiniLM-L6-v2`, local) |
+| Reranker | `cross-encoder/ms-marco-MiniLM-L-6-v2` (local) |
+| Sparse Retrieval | BM25 via `rank-bm25` |
+| LLM | Groq (`llama-3.3-70b-versatile`) + Gemini 2.0 Flash fallback |
+| Auth & Database | Supabase (PostgreSQL + Auth) |
+| Caching | TTLCache (L1) → Redis/Upstash (L2) → SQLite (fallback) |
+| PDF Processing | PyMuPDF |
+| Text Splitting | LangChain text splitters |
+| Hosting | Render (backend), Vercel (frontend proxy) |
+| Containerization | Docker |
+| CI/CD | GitHub Actions |
 
-## API Endpoints
+## Getting Started
 
-- `GET /` → web app
-- `POST /upload` → upload a PDF (`pdf` form field)
-- `GET /documents` → list indexed documents with chunk counts
-- `POST /ask` → ask a question (`question` form field), returns `{ response, sources }`
+### Prerequisites
 
-## Local Setup
+- Python 3.10+
+- [Groq API key](https://console.groq.com)
+- [Qdrant Cloud](https://cloud.qdrant.io) cluster
+- [Supabase](https://supabase.com/dashboard) project
+- Redis (optional — [Upstash](https://upstash.com) recommended for cloud deployments)
+- [Gemini API key](https://aistudio.google.com) (optional, for LLM fallback)
+
+### Installation
 
 ```bash
-git clone https://github.com/manamsriram/DocSense-AI.git
-cd DocSense-AI
+git clone https://github.com/manamsriram/AI-PDF-Reader.git
+cd AI-PDF-Reader
 
 python -m venv venv
 source venv/bin/activate  # Windows: venv\Scripts\activate
@@ -56,20 +78,37 @@ source venv/bin/activate  # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Create a `.env` file:
+### Configuration
 
-```env
-GROQ_API_KEY=your_groq_key
-GROQ_MODEL=llama-3.3-70b-versatile
-QDRANT_URL=https://your-qdrant-endpoint
-QDRANT_API_KEY=your-qdrant-api-key
-
-# Optional Redis cache
-REDIS_HOST=localhost
-REDIS_PORT=6379
+```bash
+cp .env.example .env
 ```
 
-Run the app:
+Edit `.env` with your credentials:
+
+```env
+# LLM
+GROQ_API_KEY=your_groq_key
+GROQ_MODEL=llama-3.3-70b-versatile
+
+# LLM Fallback (optional)
+GEMINI_API_KEY=your_gemini_key
+GEMINI_MODEL=gemini-2.0-flash
+
+# Vector Database
+QDRANT_URL=https://your-cluster.qdrant.io
+QDRANT_API_KEY=your_qdrant_key
+
+# Auth & Storage
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_ANON_KEY=your_anon_key
+SUPABASE_SERVICE_KEY=your_service_key
+
+# Cache (optional)
+REDIS_URL=rediss://default:<token>@<host>.upstash.io:6379
+```
+
+### Running Locally
 
 ```bash
 python app.py
@@ -77,40 +116,53 @@ python app.py
 
 Open `http://127.0.0.1:5000`.
 
-## Docker
-
-Build and run:
+### Docker
 
 ```bash
-docker build -t docsense-ai .
-docker run --rm -p 10000:10000 --env-file .env docsense-ai
+docker build -t ai-pdf-reader .
+docker run --rm -p 10000:10000 --env-file .env ai-pdf-reader
 ```
 
 The container starts Gunicorn on port `10000`.
 
-## Frontend + Backend Split Deployment
+## Usage
 
-This repo includes `vercel.json` rewrites for `/ask`, `/upload`, and `/documents`.
+1. Sign in via Supabase Auth.
+2. Upload one or more PDFs using the upload panel.
+3. Ask questions in natural language — answers include source snippets and page references.
+4. Continue the conversation; prior turns are included as context for follow-up questions.
+5. Start a new session with the **New Chat** button to reset context.
 
-Typical setup:
+## Architecture
 
-1. Deploy Flask backend (e.g., Render).
-2. Deploy frontend files on Vercel.
-3. Update `vercel.json` destinations to your backend URL.
+Upload flow: PDF → PyMuPDF page extraction → LangChain chunking → FastEmbed embeddings → Qdrant (per-user namespace).
 
-## Tests
+Query flow: question → (optional) query decomposition → hybrid search (Qdrant dense + BM25 sparse, fused via RRF) → cross-encoder rerank → CRAG grading loop → `generate_text()` (Groq / Gemini fallback) → response with citations.
 
-The repository contains pytest tests in `tests/test_app.py`.
+Caching: cache key hashed from `(user_id, question, session_id)` → check TTLCache → check Redis → check SQLite → on miss, run full pipeline and populate all layers.
 
-If pytest is not installed in your environment:
+## API Reference
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/` | Web application |
+| POST | `/upload` | Upload a PDF (`pdf` form field) |
+| GET | `/documents` | List indexed documents with chunk counts |
+| POST | `/ask` | Ask a question (`question`, `session_id`); returns `{ response, sources }` |
+| GET | `/history` | Retrieve session-grouped conversation history |
+
+All endpoints except `GET /` require a valid Supabase JWT in the `Authorization` header.
+
+## Contributing
 
 ```bash
-pip install pytest
-pytest -q
+git checkout -b feature/your-feature
+git commit -m "feat: describe your change"
+git push origin feature/your-feature
 ```
 
-## Notes
+Open a pull request against `master`. Run `pytest -q` before submitting.
 
-- First startup can be slow because embedding/reranker models are loaded.
-- Uploaded PDFs are indexed into the `documents` collection in Qdrant.
-- Redis is optional; the app falls back gracefully when Redis is unavailable.
+## License
+
+[MIT](LICENSE)
