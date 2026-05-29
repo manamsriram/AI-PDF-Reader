@@ -8,13 +8,13 @@
   <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</head>
+<body x-data="docsenseApp" x-init="init()">
+
   <div id="supabase-config"
        data-url="{{ supabase_url }}"
        data-key="{{ supabase_anon_key }}"
        hidden></div>
-  <script src="/static/js/app.js"></script>
-</head>
-<body x-data="docsenseApp" x-init="init()">
 
   <!-- Auth modal -->
   <div class="auth-overlay" x-show="!authToken" x-cloak>
@@ -180,5 +180,6 @@
 
   </div>
 
+  <script src="/static/js/app.js"></script>
 </body>
 </html>

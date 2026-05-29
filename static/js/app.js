@@ -1,5 +1,12 @@
-const _cfg = document.getElementById('supabase-config');
-const _supabase = supabase.createClient(_cfg.dataset.url, _cfg.dataset.key);
+let _supabase = null;
+try {
+  const _cfg = document.getElementById('supabase-config');
+  if (_cfg && _cfg.dataset.url) {
+    _supabase = supabase.createClient(_cfg.dataset.url, _cfg.dataset.key);
+  }
+} catch (e) {
+  console.error('Supabase client init failed:', e);
+}
 
 document.addEventListener('alpine:init', () => {
   Alpine.data('docsenseApp', () => ({
@@ -47,6 +54,7 @@ document.addEventListener('alpine:init', () => {
 
     async login() {
       this.authError = '';
+      if (!_supabase) { this.authError = 'Auth not configured. Check server env vars.'; return; }
       this.authLoading = true;
       try {
         const { data, error } = await _supabase.auth.signInWithPassword({
@@ -67,6 +75,7 @@ document.addEventListener('alpine:init', () => {
 
     async signup() {
       this.authError = '';
+      if (!_supabase) { this.authError = 'Auth not configured. Check server env vars.'; return; }
       this.authLoading = true;
       try {
         const { data, error } = await _supabase.auth.signUp({
@@ -90,7 +99,7 @@ document.addEventListener('alpine:init', () => {
     },
 
     async logout() {
-      await _supabase.auth.signOut();
+      if (_supabase) await _supabase.auth.signOut();
       this.authToken = null;
       localStorage.removeItem('sb_token');
       this.messages = [];
