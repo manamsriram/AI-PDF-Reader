@@ -25,10 +25,16 @@
         <button class="auth-tab" :class="{ active: authMode === 'signup' }" @click="authMode = 'signup'; authError = ''">Sign Up</button>
       </div>
       <div class="auth-error" x-show="authError" x-text="authError"></div>
+      <input class="auth-input" type="text" x-model="authName" placeholder="Full Name"
+             x-show="authMode === 'signup'"
+             @keydown.enter="signup()">
       <input class="auth-input" type="email" x-model="authEmail" placeholder="Email"
              @keydown.enter="authMode === 'login' ? login() : signup()">
       <input class="auth-input" type="password" x-model="authPassword" placeholder="Password"
              @keydown.enter="authMode === 'login' ? login() : signup()">
+      <input class="auth-input" type="password" x-model="authConfirmPassword" placeholder="Confirm Password"
+             x-show="authMode === 'signup'"
+             @keydown.enter="signup()">
       <button class="auth-submit" @click="authMode === 'login' ? login() : signup()" :disabled="authLoading">
         <span x-text="authLoading ? 'Please wait…' : (authMode === 'login' ? 'Sign In' : 'Create Account')"></span>
       </button>

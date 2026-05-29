@@ -15,6 +15,8 @@ document.addEventListener('alpine:init', () => {
     authMode: 'login',
     authEmail: '',
     authPassword: '',
+    authName: '',
+    authConfirmPassword: '',
     authError: '',
     authLoading: false,
 
@@ -31,6 +33,14 @@ document.addEventListener('alpine:init', () => {
     sidebarOpen: true,
 
     async init() {
+      if (!this.authToken && _supabase && window.location.hash.includes('access_token')) {
+        const { data } = await _supabase.auth.getSession();
+        if (data?.session) {
+          this.authToken = data.session.access_token;
+          localStorage.setItem('sb_token', this.authToken);
+          window.history.replaceState(null, '', window.location.pathname);
+        }
+      }
       if (!this.authToken) return;
       // Validate token by calling an auth-protected endpoint
       try {
@@ -76,11 +86,14 @@ document.addEventListener('alpine:init', () => {
     async signup() {
       this.authError = '';
       if (!_supabase) { this.authError = 'Auth not configured. Check server env vars.'; return; }
+      if (!this.authName.trim()) { this.authError = 'Please enter your name.'; return; }
+      if (this.authPassword !== this.authConfirmPassword) { this.authError = 'Passwords do not match.'; return; }
       this.authLoading = true;
       try {
         const { data, error } = await _supabase.auth.signUp({
           email: this.authEmail,
           password: this.authPassword,
+          options: { data: { full_name: this.authName.trim() } },
         });
         if (error) { this.authError = error.message; return; }
         if (data.session) {
