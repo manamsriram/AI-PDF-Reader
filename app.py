@@ -23,7 +23,6 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
-ssl._create_default_https_context = ssl._create_unverified_context
 
 app = Flask(__name__, static_url_path='', static_folder='.')
 
@@ -148,7 +147,13 @@ def index_pdf(pdf_path, force=False):
     """Extract, chunk, embed, and upsert a PDF into Qdrant. Returns chunk count."""
     filename = os.path.basename(pdf_path)
 
-    if not force:
+    if force:
+        qdrant.delete(
+            collection_name=COLLECTION,
+            points_selector=Filter(must=[FieldCondition(key="source", match=MatchValue(value=filename))])
+        )
+        logging.info(f"Deleted existing chunks for: {filename}")
+    else:
         existing, _ = qdrant.scroll(
             collection_name=COLLECTION,
             scroll_filter=Filter(must=[FieldCondition(key="source", match=MatchValue(value=filename))]),
@@ -226,9 +231,10 @@ def reciprocal_rank_fusion(ranked_lists, k=60):
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
-def hybrid_search(query, top_k=20):
+def hybrid_search(query, top_k=20, collection_count=None):
     """Combine dense (Qdrant) and sparse (BM25) retrieval via RRF."""
-    if get_collection_count() == 0:
+    count = collection_count if collection_count is not None else get_collection_count()
+    if count == 0:
         return []
 
     # Dense retrieval via Qdrant
@@ -236,7 +242,7 @@ def hybrid_search(query, top_k=20):
     hits = qdrant.search(
         collection_name=COLLECTION,
         query_vector=query_vec,
-        limit=min(top_k, get_collection_count()),
+        limit=min(top_k, count),
         with_payload=True
     )
     dense_ids = [str(h.id) for h in hits]
@@ -273,10 +279,11 @@ def _sigmoid(x):
 
 def find_relevant_chunks(query, top_n=3):
     """Return [(score, text), ...] where score is a float in (0, 1), sigmoid-normalized from raw reranker logit."""
-    if get_collection_count() == 0:
+    count = get_collection_count()
+    if count == 0:
         return []
 
-    candidates = hybrid_search(query, top_k=20)
+    candidates = hybrid_search(query, top_k=20, collection_count=count)
     if not candidates:
         return []
 
@@ -309,8 +316,8 @@ def generate_text(prompt):
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        logging.error(f"Groq API error: {e}")
-        return f"Error generating response: {e}"
+        logging.error(f"Groq API error: {e}", exc_info=True)
+        return None
 
 
 def ask_file(question):
@@ -341,6 +348,8 @@ def ask_file(question):
 
     prompt += f"Question: {question}\nAnswer:"
     response = generate_text(prompt)
+    if response is None:
+        return None, []
     return response, sources
 
 
@@ -372,20 +381,24 @@ def store_query_response(query, response):
 
 
 def get_cached_response(query):
+    """Return (response, sources) from Redis, or (None, None) on miss/error."""
     if not redis_client:
-        return None
+        return None, None
     try:
         cached = redis_client.get(query)
-        return json.loads(cached) if cached else None
+        if not cached:
+            return None, None
+        data = json.loads(cached)
+        return data.get("response"), data.get("sources", [])
     except Exception:
-        return None
+        return None, None
 
 
-def cache_response(query, response, ttl=3600):
+def cache_response(query, response, sources, ttl=3600):
     if not redis_client:
         return
     try:
-        redis_client.setex(query, ttl, json.dumps(response))
+        redis_client.setex(query, ttl, json.dumps({"response": response, "sources": sources}))
     except Exception:
         pass
 
@@ -473,15 +486,19 @@ def ask():
         if not question:
             return jsonify({'error': 'No question provided'}), 400
 
-        sources = []
-        response = get_cached_response(question)
+        response, sources = get_cached_response(question)
         if response is None:
-            response = get_response_from_db(question)
-            if not response:
+            db_response = get_response_from_db(question)
+            if db_response:
+                response, sources = db_response, []
+            else:
                 response, sources = ask_file(question)
-                if response and "No documents" not in response:
+                if response is not None and "No documents" not in response:
                     store_query_response(question, response)
-                    cache_response(question, response)
+                    cache_response(question, response, sources)
+
+        if response is None:
+            return jsonify({'error': 'Failed to generate a response, please try again'}), 500
 
         return jsonify({'response': response, 'sources': sources})
 
