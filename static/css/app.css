@@ -492,7 +492,16 @@ body {
   color: #fff;
 }
 
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
 .auth-input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
   background: var(--bg-inset);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -508,6 +517,9 @@ body {
 .auth-input::placeholder { color: var(--text-secondary); }
 
 .auth-submit {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
   background: var(--accent-green-dim);
   color: #fff;
   border: none;
@@ -518,7 +530,6 @@ body {
   font-weight: 500;
   cursor: pointer;
   transition: filter 0.15s;
-  margin-top: 4px;
 }
 
 .auth-submit:hover:not(:disabled) { filter: brightness(1.15); }

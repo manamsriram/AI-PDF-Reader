@@ -38,7 +38,7 @@
 
       <!-- Login / Signup form -->
       <template x-if="!authVerifyPending">
-        <div>
+        <div class="auth-form">
           <div class="auth-tabs">
             <button class="auth-tab" :class="{ active: authMode === 'login' }" @click="authMode = 'login'; authError = ''">Sign In</button>
             <button class="auth-tab" :class="{ active: authMode === 'signup' }" @click="authMode = 'signup'; authError = ''">Sign Up</button>
