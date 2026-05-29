@@ -15,3 +15,8 @@ build/
 __pycache__
 .DS_Store
 graphify-out
+*.db
+tmp/
+temp/
+.env.*
+!.env.example

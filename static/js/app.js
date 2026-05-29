@@ -1,21 +1,134 @@
+const _cfg = document.getElementById('supabase-config');
+const _supabase = supabase.createClient(_cfg.dataset.url, _cfg.dataset.key);
+
 document.addEventListener('alpine:init', () => {
   Alpine.data('docsenseApp', () => ({
+    // Auth
+    authToken: localStorage.getItem('sb_token') || null,
+    authMode: 'login',
+    authEmail: '',
+    authPassword: '',
+    authError: '',
+    authLoading: false,
+
+    // App
     messages: [],
     sources: [],
     documents: [],
+    history: [],
     question: '',
     loading: false,
     docsExpanded: false,
     uploadStatus: '',
     uploadStatusType: '',
+    sidebarOpen: true,
 
     async init() {
+      if (!this.authToken) return;
+      // Validate token by calling an auth-protected endpoint
+      try {
+        const res = await fetch('/history', { headers: this.authHeaders() });
+        if (res.status === 401) {
+          this.authToken = null;
+          localStorage.removeItem('sb_token');
+          return;
+        }
+        const data = await res.json();
+        this.history = data.history || [];
+      } catch (e) {
+        console.error('Init check failed:', e);
+      }
       await this.loadDocuments();
+    },
+
+    authHeaders() {
+      return this.authToken ? { 'Authorization': `Bearer ${this.authToken}` } : {};
+    },
+
+    async login() {
+      this.authError = '';
+      this.authLoading = true;
+      try {
+        const { data, error } = await _supabase.auth.signInWithPassword({
+          email: this.authEmail,
+          password: this.authPassword,
+        });
+        if (error) { this.authError = error.message; return; }
+        this.authToken = data.session.access_token;
+        localStorage.setItem('sb_token', this.authToken);
+        await this.loadDocuments();
+        await this.loadHistory();
+      } catch (e) {
+        this.authError = 'Sign in failed. Please try again.';
+      } finally {
+        this.authLoading = false;
+      }
+    },
+
+    async signup() {
+      this.authError = '';
+      this.authLoading = true;
+      try {
+        const { data, error } = await _supabase.auth.signUp({
+          email: this.authEmail,
+          password: this.authPassword,
+        });
+        if (error) { this.authError = error.message; return; }
+        if (data.session) {
+          this.authToken = data.session.access_token;
+          localStorage.setItem('sb_token', this.authToken);
+          await this.loadDocuments();
+          await this.loadHistory();
+        } else {
+          this.authError = 'Check your email to confirm your account, then sign in.';
+        }
+      } catch (e) {
+        this.authError = 'Sign up failed. Please try again.';
+      } finally {
+        this.authLoading = false;
+      }
+    },
+
+    async logout() {
+      await _supabase.auth.signOut();
+      this.authToken = null;
+      localStorage.removeItem('sb_token');
+      this.messages = [];
+      this.sources = [];
+      this.documents = [];
+      this.history = [];
+      this.question = '';
+    },
+
+    async loadHistory() {
+      try {
+        const res = await fetch('/history', { headers: this.authHeaders() });
+        if (!res.ok) return;
+        const data = await res.json();
+        this.history = data.history || [];
+      } catch (e) {
+        console.error('Failed to load history:', e);
+      }
+    },
+
+    loadHistoryItem(item) {
+      this.messages = [
+        { role: 'user', text: item.question },
+        { role: 'bot', text: item.answer, html: marked.parse(item.answer) },
+      ];
+      this.sources = item.sources || [];
+      this.$nextTick(() => this._scrollToBottom());
+    },
+
+    formatDate(iso) {
+      return new Date(iso).toLocaleDateString(undefined, {
+        month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+      });
     },
 
     async loadDocuments() {
       try {
-        const res = await fetch('/documents');
+        const res = await fetch('/documents', { headers: this.authHeaders() });
         const data = await res.json();
         this.documents = data.documents || [];
       } catch (e) {
@@ -47,7 +160,11 @@ document.addEventListener('alpine:init', () => {
       formData.append('pdf', file);
 
       try {
-        const res = await fetch('/upload', { method: 'POST', body: formData });
+        const res = await fetch('/upload', {
+          method: 'POST',
+          headers: this.authHeaders(),
+          body: formData,
+        });
         const data = await res.json();
         if (data.error) {
           this.uploadStatus = `Error: ${data.error}`;
@@ -75,7 +192,6 @@ document.addEventListener('alpine:init', () => {
       this.loading = true;
       this.sources = [];
 
-      // Reset textarea height
       const ta = this.$refs.textarea;
       if (ta) { ta.style.height = 'auto'; }
 
@@ -85,7 +201,7 @@ document.addEventListener('alpine:init', () => {
       try {
         const res = await fetch('/ask', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...this.authHeaders() },
           body: 'question=' + encodeURIComponent(q),
         });
 
@@ -94,13 +210,9 @@ document.addEventListener('alpine:init', () => {
         const data = await res.json();
         const text = data.response || "I couldn't find an answer.";
 
-        this.messages.push({
-          role: 'bot',
-          text,
-          html: marked.parse(text),
-        });
-
+        this.messages.push({ role: 'bot', text, html: marked.parse(text) });
         this.sources = data.sources || [];
+        this.loadHistory();
       } catch (e) {
         const fallback = 'Something went wrong, please try again.';
         this.messages.push({ role: 'bot', text: fallback, html: fallback });

@@ -6,13 +6,38 @@
   <title>DocSense AI</title>
   <link rel="stylesheet" href="/static/css/app.css">
   <script src="https://cdn.jsdelivr.net/npm/marked@9/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <div id="supabase-config"
+       data-url="{{ supabase_url }}"
+       data-key="{{ supabase_anon_key }}"
+       hidden></div>
   <script src="/static/js/app.js"></script>
 </head>
 <body x-data="docsenseApp" x-init="init()">
 
+  <!-- Auth modal -->
+  <div class="auth-overlay" x-show="!authToken" x-cloak>
+    <div class="auth-modal">
+      <div class="auth-modal-title">DocSense AI</div>
+      <div class="auth-tabs">
+        <button class="auth-tab" :class="{ active: authMode === 'login' }" @click="authMode = 'login'; authError = ''">Sign In</button>
+        <button class="auth-tab" :class="{ active: authMode === 'signup' }" @click="authMode = 'signup'; authError = ''">Sign Up</button>
+      </div>
+      <div class="auth-error" x-show="authError" x-text="authError"></div>
+      <input class="auth-input" type="email" x-model="authEmail" placeholder="Email"
+             @keydown.enter="authMode === 'login' ? login() : signup()">
+      <input class="auth-input" type="password" x-model="authPassword" placeholder="Password"
+             @keydown.enter="authMode === 'login' ? login() : signup()">
+      <button class="auth-submit" @click="authMode === 'login' ? login() : signup()" :disabled="authLoading">
+        <span x-text="authLoading ? 'Please wait…' : (authMode === 'login' ? 'Sign In' : 'Create Account')"></span>
+      </button>
+    </div>
+  </div>
+
   <!-- Navbar -->
-  <nav class="navbar">
+  <nav class="navbar" x-show="authToken" x-cloak>
+    <button class="history-toggle" @click="sidebarOpen = !sidebarOpen" title="Toggle history">☰</button>
     <span class="navbar-brand">DocSense AI</span>
     <div class="navbar-spacer"></div>
     <div class="model-badge">
@@ -23,10 +48,11 @@
       ☰ <span x-text="docCount"></span> Docs
       <span x-text="docsExpanded ? '▾' : '▸'"></span>
     </button>
+    <button class="btn-logout" @click="logout()">Sign Out</button>
   </nav>
 
   <!-- Collapsible docs bar -->
-  <div class="docs-bar">
+  <div class="docs-bar" x-show="authToken" x-cloak>
     <div class="docs-bar-summary" @click="toggleDocs()">
       <span class="docs-bar-arrow" x-text="docsExpanded ? '▾' : '▸'"></span>
       <span class="docs-bar-label"
@@ -60,20 +86,34 @@
   </div>
 
   <!-- Main content -->
-  <div class="content">
+  <div class="content" x-show="authToken" x-cloak>
+
+    <!-- History sidebar -->
+    <div class="history-sidebar" :class="{ open: sidebarOpen }">
+      <div class="history-header">History</div>
+      <div class="history-body">
+        <template x-if="history.length === 0">
+          <div class="history-empty">No queries yet.</div>
+        </template>
+        <template x-for="(item, i) in history" :key="item.id">
+          <div class="history-item" @click="loadHistoryItem(item)">
+            <div class="history-item-question" x-text="item.question"></div>
+            <div class="history-item-date" x-text="formatDate(item.created_at)"></div>
+          </div>
+        </template>
+      </div>
+    </div>
 
     <!-- Chat panel -->
     <div class="chat-panel">
       <div class="messages" x-ref="messagesList">
 
-        <!-- Empty state -->
         <template x-if="messages.length === 0 && !loading">
           <div class="messages-empty">
             Upload a PDF above, then ask anything about it.
           </div>
         </template>
 
-        <!-- Messages -->
         <template x-for="(msg, i) in messages" :key="i">
           <div :class="msg.role === 'user' ? 'message message-user' : 'message message-bot'">
             <template x-if="msg.role === 'user'">
@@ -85,7 +125,6 @@
           </div>
         </template>
 
-        <!-- Typing indicator -->
         <div class="typing-indicator" x-show="loading">
           Thinking
           <span class="typing-dots">
@@ -95,7 +134,6 @@
 
       </div>
 
-      <!-- Input area -->
       <div class="input-area">
         <textarea
           class="input-textarea"

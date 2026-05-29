@@ -1,12 +1,12 @@
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, render_template, g
 from werkzeug.utils import secure_filename
-import sqlite3
+from functools import wraps
+import tempfile
 import redis
 import json
 import math
 import os
 import re
-import ssl
 import pymupdf
 import numpy as np
 import logging
@@ -20,6 +20,7 @@ from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, PayloadSchemaType
 from rank_bm25 import BM25Okapi
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from supabase import create_client, Client
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -30,9 +31,11 @@ app = Flask(__name__, static_url_path='', static_folder='.')
 groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
 GROQ_MODEL = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
 
-DATABASE = 'chatbot.db'
-PDF_FOLDER = 'pdfFolder'
 COLLECTION = 'documents'
+
+# Supabase clients
+supabase_anon: Client = create_client(os.getenv('SUPABASE_URL'), os.getenv('SUPABASE_ANON_KEY'))
+supabase_admin: Client = create_client(os.getenv('SUPABASE_URL'), os.getenv('SUPABASE_SERVICE_KEY'))
 
 # Redis (optional — caching disabled gracefully if unavailable)
 REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
@@ -50,6 +53,7 @@ _embedding_model = None
 _reranker_model = None
 _model_lock = threading.Lock()
 
+
 def get_embedding_model():
     global _embedding_model
     if _embedding_model is None:
@@ -61,6 +65,7 @@ def get_embedding_model():
                     cache_dir=os.getenv('FASTEMBED_CACHE_PATH', None)
                 )
     return _embedding_model
+
 
 def get_reranker_model():
     global _reranker_model
@@ -74,6 +79,7 @@ def get_reranker_model():
                 )
     return _reranker_model
 
+
 # Qdrant Cloud vector store
 qdrant = QdrantClient(url=os.getenv('QDRANT_URL'), api_key=os.getenv('QDRANT_API_KEY'))
 if not qdrant.collection_exists(COLLECTION):
@@ -81,12 +87,23 @@ if not qdrant.collection_exists(COLLECTION):
         collection_name=COLLECTION,
         vectors_config=VectorParams(size=384, distance=Distance.COSINE)
     )
-    qdrant.create_payload_index(
-        collection_name=COLLECTION,
-        field_name="source",
-        field_schema=PayloadSchemaType.KEYWORD
-    )
+    for field in ('source', 'user_id'):
+        qdrant.create_payload_index(
+            collection_name=COLLECTION,
+            field_name=field,
+            field_schema=PayloadSchemaType.KEYWORD
+        )
     logging.info(f"Created Qdrant collection: {COLLECTION}")
+else:
+    # Ensure user_id index exists on pre-existing collection
+    try:
+        qdrant.create_payload_index(
+            collection_name=COLLECTION,
+            field_name='user_id',
+            field_schema=PayloadSchemaType.KEYWORD
+        )
+    except Exception:
+        pass
 
 # Sentence-boundary-aware chunker with overlap
 text_splitter = RecursiveCharacterTextSplitter(
@@ -95,32 +112,88 @@ text_splitter = RecursiveCharacterTextSplitter(
     separators=["\n\n", "\n", ". ", " ", ""]
 )
 
-# BM25 sparse index (in-memory, rebuilt from Qdrant on startup/upload)
-bm25_index = None
-bm25_corpus = []   # list of (point_id, display_text)
+# BM25 sparse index — per-user dicts, rebuilt from Qdrant on startup/upload
+bm25_indices = {}   # user_id -> BM25Okapi
+bm25_corpora = {}   # user_id -> list of (point_id, display_text)
 bm25_lock = threading.Lock()
 _bm25_ready = False
 
 
+# ---- Auth ----
+
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get('Authorization', '')
+        if not auth_header.startswith('Bearer '):
+            return jsonify({'error': 'Unauthorized'}), 401
+        token = auth_header[7:]
+        try:
+            user_response = supabase_admin.auth.get_user(token)
+            if not user_response.user:
+                return jsonify({'error': 'Unauthorized'}), 401
+            g.user_id = str(user_response.user.id)
+        except Exception:
+            return jsonify({'error': 'Unauthorized'}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+
 # ---- Indexing ----
 
-def rebuild_bm25():
-    global bm25_index, bm25_corpus
-    records, _ = qdrant.scroll(collection_name=COLLECTION, with_payload=True, limit=10000)
+def rebuild_bm25_for_user(user_id):
+    records, _ = qdrant.scroll(
+        collection_name=COLLECTION,
+        scroll_filter=Filter(must=[FieldCondition(key='user_id', match=MatchValue(value=user_id))]),
+        with_payload=True,
+        limit=10000
+    )
     if not records:
         with bm25_lock:
-            bm25_index = None
-            bm25_corpus = []
+            bm25_indices.pop(user_id, None)
+            bm25_corpora.pop(user_id, None)
         return
 
-    texts = [r.payload.get("text", "") for r in records]
+    texts = [r.payload.get('text', '') for r in records]
     ids = [str(r.id) for r in records]
     tokenized = [t.lower().split() for t in texts]
 
     with bm25_lock:
-        bm25_index = BM25Okapi(tokenized)
-        bm25_corpus = list(zip(ids, texts))
-    logging.info(f"BM25 rebuilt with {len(bm25_corpus)} chunks")
+        bm25_indices[user_id] = BM25Okapi(tokenized)
+        bm25_corpora[user_id] = list(zip(ids, texts))
+    logging.info(f"BM25 rebuilt for user {user_id[:8]}... with {len(texts)} chunks")
+
+
+def rebuild_all_bm25():
+    """Scroll all Qdrant records and rebuild per-user BM25 indices."""
+    all_records = []
+    offset = None
+    while True:
+        batch, offset = qdrant.scroll(
+            collection_name=COLLECTION, with_payload=True, limit=1000, offset=offset
+        )
+        all_records.extend(batch)
+        if offset is None:
+            break
+
+    user_chunks = {}
+    for r in all_records:
+        uid = r.payload.get('user_id')
+        if uid:
+            user_chunks.setdefault(uid, []).append(r)
+
+    with bm25_lock:
+        bm25_indices.clear()
+        bm25_corpora.clear()
+
+    for uid, records in user_chunks.items():
+        texts = [r.payload.get('text', '') for r in records]
+        ids = [str(r.id) for r in records]
+        tokenized = [t.lower().split() for t in texts]
+        with bm25_lock:
+            bm25_indices[uid] = BM25Okapi(tokenized)
+            bm25_corpora[uid] = list(zip(ids, texts))
+    logging.info(f"BM25 rebuilt for {len(user_chunks)} user(s)")
 
 
 def preprocess(text):
@@ -133,7 +206,7 @@ def pdf_to_pages(path):
         doc = pymupdf.open(path)
         pages = []
         for page_num in range(doc.page_count):
-            text = preprocess(doc[page_num].get_text("text"))
+            text = preprocess(doc[page_num].get_text('text'))
             if text:
                 pages.append((page_num + 1, text))
         doc.close()
@@ -143,20 +216,26 @@ def pdf_to_pages(path):
         return []
 
 
-def index_pdf(pdf_path, force=False):
-    """Extract, chunk, embed, and upsert a PDF into Qdrant. Returns chunk count."""
+def index_pdf(pdf_path, user_id, force=False):
+    """Extract, chunk, embed, and upsert a PDF into Qdrant for a specific user."""
     filename = os.path.basename(pdf_path)
 
     if force:
         qdrant.delete(
             collection_name=COLLECTION,
-            points_selector=Filter(must=[FieldCondition(key="source", match=MatchValue(value=filename))])
+            points_selector=Filter(must=[
+                FieldCondition(key='source', match=MatchValue(value=filename)),
+                FieldCondition(key='user_id', match=MatchValue(value=user_id))
+            ])
         )
-        logging.info(f"Deleted existing chunks for: {filename}")
+        logging.info(f"Deleted existing chunks for {filename} (user {user_id[:8]}...)")
     else:
         existing, _ = qdrant.scroll(
             collection_name=COLLECTION,
-            scroll_filter=Filter(must=[FieldCondition(key="source", match=MatchValue(value=filename))]),
+            scroll_filter=Filter(must=[
+                FieldCondition(key='source', match=MatchValue(value=filename)),
+                FieldCondition(key='user_id', match=MatchValue(value=user_id))
+            ]),
             limit=1
         )
         if existing:
@@ -176,10 +255,9 @@ def index_pdf(pdf_path, force=False):
         for chunk_idx, chunk in enumerate(chunks):
             if not chunk.strip():
                 continue
-            # Deterministic UUID so re-indexing the same file is idempotent
-            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{filename}__p{page_num}__c{chunk_idx}"))
+            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{user_id}__{filename}__p{page_num}__c{chunk_idx}"))
             display_text = f"[Page {page_num}, Source: {filename}] {chunk}"
-            embed_texts.append(chunk)       # embed content only, not the prefix
+            embed_texts.append(chunk)
             display_texts.append(display_text)
             points.append((point_id, filename, page_num, display_text))
 
@@ -194,31 +272,31 @@ def index_pdf(pdf_path, force=False):
             PointStruct(
                 id=point_id,
                 vector=vec.tolist(),
-                payload={"source": filename, "page": page_num, "text": display_text}
+                payload={'source': filename, 'page': page_num, 'text': display_text, 'user_id': user_id}
             )
             for (point_id, filename, page_num, display_text), vec in zip(points, vecs)
         ]
     )
-    logging.info(f"Indexed {len(points)} chunks from {filename}")
+    logging.info(f"Indexed {len(points)} chunks from {filename} for user {user_id[:8]}...")
     return len(points)
 
 
 def init_index():
     global _bm25_ready
-    os.makedirs(PDF_FOLDER, exist_ok=True)
-    for fname in os.listdir(PDF_FOLDER):
-        if fname.endswith('.pdf'):
-            index_pdf(os.path.join(PDF_FOLDER, fname))
-    rebuild_bm25()
+    rebuild_all_bm25()
     _bm25_ready = True
     logging.info("Startup init complete.")
 
 
 # ---- Retrieval ----
 
-def get_collection_count():
+def get_collection_count(user_id):
     try:
-        return qdrant.count(collection_name=COLLECTION).count
+        result = qdrant.count(
+            collection_name=COLLECTION,
+            count_filter=Filter(must=[FieldCondition(key='user_id', match=MatchValue(value=user_id))])
+        )
+        return result.count
     except Exception:
         return 0
 
@@ -231,27 +309,28 @@ def reciprocal_rank_fusion(ranked_lists, k=60):
     return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
 
-def hybrid_search(query, top_k=20, collection_count=None):
-    """Combine dense (Qdrant) and sparse (BM25) retrieval via RRF."""
-    count = collection_count if collection_count is not None else get_collection_count()
+def hybrid_search(query, user_id, top_k=20):
+    """Combine dense (Qdrant) and sparse (BM25) retrieval via RRF for a single user."""
+    count = get_collection_count(user_id)
     if count == 0:
         return []
 
-    # Dense retrieval via Qdrant
+    # Dense retrieval via Qdrant, filtered to this user
     query_vec = list(get_embedding_model().embed([query]))[0].tolist()
     hits = qdrant.search(
         collection_name=COLLECTION,
         query_vector=query_vec,
+        query_filter=Filter(must=[FieldCondition(key='user_id', match=MatchValue(value=user_id))]),
         limit=min(top_k, count),
         with_payload=True
     )
     dense_ids = [str(h.id) for h in hits]
-    dense_doc_map = {str(h.id): h.payload.get("text", "") for h in hits}
+    dense_doc_map = {str(h.id): h.payload.get('text', '') for h in hits}
 
-    # Sparse retrieval via BM25
+    # Sparse retrieval via per-user BM25
     with bm25_lock:
-        local_bm25 = bm25_index
-        local_corpus = list(bm25_corpus)
+        local_bm25 = bm25_indices.get(user_id)
+        local_corpus = list(bm25_corpora.get(user_id, []))
 
     sparse_ids = []
     if local_bm25 and local_corpus:
@@ -261,7 +340,6 @@ def hybrid_search(query, top_k=20, collection_count=None):
 
     # RRF fusion
     fused = reciprocal_rank_fusion([dense_ids, sparse_ids])
-
     corpus_map = {cid: text for cid, text in local_corpus}
     corpus_map.update(dense_doc_map)
 
@@ -277,13 +355,12 @@ def _sigmoid(x):
     return 1.0 / (1.0 + math.exp(-x))
 
 
-def find_relevant_chunks(query, top_n=3):
-    """Return [(score, text), ...] where score is a float in (0, 1), sigmoid-normalized from raw reranker logit."""
-    count = get_collection_count()
-    if count == 0:
+def find_relevant_chunks(query, user_id, top_n=3):
+    """Return [(score, text), ...] reranked for a specific user."""
+    if get_collection_count(user_id) == 0:
         return []
 
-    candidates = hybrid_search(query, top_k=20, collection_count=count)
+    candidates = hybrid_search(query, user_id, top_k=20)
     if not candidates:
         return []
 
@@ -301,15 +378,15 @@ def generate_text(prompt):
             model=GROQ_MODEL,
             messages=[
                 {
-                    "role": "system",
-                    "content": (
-                        "You are a helpful assistant that answers questions based on "
-                        "provided document excerpts. Always cite page numbers when referencing "
-                        "information. If the answer is not found in the provided context, "
-                        "say so clearly rather than guessing."
+                    'role': 'system',
+                    'content': (
+                        'You are a helpful assistant that answers questions based on '
+                        'provided document excerpts. Always cite page numbers when referencing '
+                        'information. If the answer is not found in the provided context, '
+                        'say so clearly rather than guessing.'
                     )
                 },
-                {"role": "user", "content": prompt}
+                {'role': 'user', 'content': prompt}
             ],
             max_tokens=750,
             temperature=0.2
@@ -320,9 +397,9 @@ def generate_text(prompt):
         return None
 
 
-def ask_file(question):
-    """Return (response_text, sources) where sources is a list of dicts."""
-    scored_chunks = find_relevant_chunks(question, top_n=3)
+def ask_file(question, user_id):
+    """Return (response_text, sources) for a specific user's documents."""
+    scored_chunks = find_relevant_chunks(question, user_id, top_n=3)
     if not scored_chunks:
         return "No documents have been indexed yet. Please upload a PDF first.", []
 
@@ -334,7 +411,6 @@ def ask_file(question):
     )
     for score, text in scored_chunks:
         prompt += f"{text}\n\n"
-        # Parse "[Page N, Source: filename] ..." prefix
         m = re.match(r'^\[Page (\d+), Source: ([^\]]+)\]\s*(.*)', text, re.DOTALL)
         if m:
             sources.append({
@@ -353,59 +429,33 @@ def ask_file(question):
     return response, sources
 
 
-# ---- Database ----
+# ---- Cache ----
 
-def init_db():
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-    c.execute('CREATE TABLE IF NOT EXISTS chat_history (id INTEGER PRIMARY KEY, query TEXT, response TEXT)')
-    conn.commit()
-    conn.close()
-
-
-def get_response_from_db(query):
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-    c.execute('SELECT response FROM chat_history WHERE query = ?', (query,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-
-def store_query_response(query, response):
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-    c.execute('INSERT INTO chat_history (query, response) VALUES (?, ?)', (query, response))
-    conn.commit()
-    conn.close()
-
-
-def get_cached_response(query):
+def get_cached_response(cache_key):
     """Return (response, sources) from Redis, or (None, None) on miss/error."""
     if not redis_client:
         return None, None
     try:
-        cached = redis_client.get(query)
+        cached = redis_client.get(cache_key)
         if not cached:
             return None, None
         data = json.loads(cached)
-        return data.get("response"), data.get("sources", [])
+        return data.get('response'), data.get('sources', [])
     except Exception:
         return None, None
 
 
-def cache_response(query, response, sources, ttl=3600):
+def cache_response(cache_key, response, sources, ttl=3600):
     if not redis_client:
         return
     try:
-        redis_client.setex(query, ttl, json.dumps({"response": response, "sources": sources}))
+        redis_client.setex(cache_key, ttl, json.dumps({'response': response, 'sources': sources}))
     except Exception:
         pass
 
 
 # ---- Startup ----
 
-init_db()
 threading.Thread(target=init_index, daemon=True).start()
 
 
@@ -413,10 +463,15 @@ threading.Thread(target=init_index, daemon=True).start()
 
 @app.route('/')
 def index():
-    return render_template('index.html')
+    return render_template(
+        'index.html',
+        supabase_url=os.getenv('SUPABASE_URL', ''),
+        supabase_anon_key=os.getenv('SUPABASE_ANON_KEY', '')
+    )
 
 
 @app.route('/upload', methods=['POST'])
+@require_auth
 def upload_pdf():
     if 'pdf' not in request.files:
         return jsonify({'error': 'No file provided'}), 400
@@ -426,41 +481,81 @@ def upload_pdf():
         return jsonify({'error': 'Please upload a valid PDF file'}), 400
 
     filename = secure_filename(file.filename)
-    os.makedirs(PDF_FOLDER, exist_ok=True)
-    save_path = os.path.join(PDF_FOLDER, filename)
-    file.save(save_path)
+    user_id = g.user_id
+    storage_path = f"{user_id}/{filename}"
 
-    count = index_pdf(save_path, force=True)
-    rebuild_bm25()
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+    try:
+        file.save(tmp.name)
+        with open(tmp.name, 'rb') as f:
+            file_bytes = f.read()
 
-    return jsonify({'message': f'Successfully indexed {count} chunks from {filename}'})
+        # Upload to Supabase Storage (remove old version first if present)
+        try:
+            supabase_admin.storage.from_('pdfs').remove([storage_path])
+        except Exception:
+            pass
+        supabase_admin.storage.from_('pdfs').upload(
+            path=storage_path,
+            file=file_bytes,
+            file_options={'content-type': 'application/pdf'}
+        )
+
+        # Index to Qdrant
+        count = index_pdf(tmp.name, user_id, force=True)
+        rebuild_bm25_for_user(user_id)
+
+        # Upsert documents record in Supabase
+        supabase_admin.table('documents').delete().eq('user_id', user_id).eq('filename', filename).execute()
+        supabase_admin.table('documents').insert({
+            'user_id': user_id,
+            'filename': filename,
+            'storage_path': storage_path,
+            'chunk_count': count
+        }).execute()
+
+        return jsonify({'message': f'Successfully indexed {count} chunks from {filename}'})
+    except Exception as e:
+        logging.error(f"Upload error: {e}", exc_info=True)
+        return jsonify({'error': 'Upload failed, please try again'}), 500
+    finally:
+        os.unlink(tmp.name)
 
 
 @app.route('/documents', methods=['GET'])
+@require_auth
 def list_documents():
     try:
-        all_records = []
-        offset = None
-        while True:
-            batch, offset = qdrant.scroll(
-                collection_name=COLLECTION,
-                with_payload=True,
-                limit=1000,
-                offset=offset
-            )
-            all_records.extend(batch)
-            if offset is None:
-                break
-        counts = {}
-        for r in all_records:
-            name = r.payload.get('source', 'unknown')
-            counts[name] = counts.get(name, 0) + 1
-        documents = [{'filename': name, 'chunks': count}
-                     for name, count in sorted(counts.items())]
+        res = (
+            supabase_admin.table('documents')
+            .select('filename,chunk_count')
+            .eq('user_id', g.user_id)
+            .order('created_at')
+            .execute()
+        )
+        documents = [{'filename': row['filename'], 'chunks': row['chunk_count']} for row in res.data]
         return jsonify({'documents': documents})
     except Exception as e:
         logging.error(f"Error in /documents: {e}")
         return jsonify({'documents': []}), 500
+
+
+@app.route('/history', methods=['GET'])
+@require_auth
+def history():
+    try:
+        res = (
+            supabase_admin.table('query_history')
+            .select('id,question,answer,sources,created_at')
+            .eq('user_id', g.user_id)
+            .order('created_at', desc=True)
+            .limit(50)
+            .execute()
+        )
+        return jsonify({'history': res.data})
+    except Exception as e:
+        logging.error(f"Error in /history: {e}")
+        return jsonify({'history': []}), 500
 
 
 @app.route('/health')
@@ -480,22 +575,30 @@ def health():
 
 
 @app.route('/ask', methods=['POST'])
+@require_auth
 def ask():
     try:
         question = request.form.get('question', '').strip()
         if not question:
             return jsonify({'error': 'No question provided'}), 400
 
-        response, sources = get_cached_response(question)
+        user_id = g.user_id
+        cache_key = f"{user_id}:{question}"
+
+        response, sources = get_cached_response(cache_key)
         if response is None:
-            db_response = get_response_from_db(question)
-            if db_response:
-                response, sources = db_response, []
-            else:
-                response, sources = ask_file(question)
-                if response is not None and "No documents" not in response:
-                    store_query_response(question, response)
-                    cache_response(question, response, sources)
+            response, sources = ask_file(question, user_id)
+            if response is not None and 'No documents' not in response:
+                cache_response(cache_key, response, sources)
+                try:
+                    supabase_admin.table('query_history').insert({
+                        'user_id': user_id,
+                        'question': question,
+                        'answer': response,
+                        'sources': sources
+                    }).execute()
+                except Exception as e:
+                    logging.warning(f"Failed to save query history: {e}")
 
         if response is None:
             return jsonify({'error': 'Failed to generate a response, please try again'}), 500
