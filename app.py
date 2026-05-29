@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify, render_template, g
 from werkzeug.utils import secure_filename
 from functools import wraps
+from cachetools import TTLCache
 import tempfile
 import redis
 import json
@@ -49,16 +50,21 @@ if _missing:
 supabase_anon: Client = create_client(os.getenv('SUPABASE_URL'), os.getenv('SUPABASE_ANON_KEY'))
 supabase_admin: Client = create_client(os.getenv('SUPABASE_URL'), os.getenv('SUPABASE_SERVICE_KEY'))
 
-# Redis (optional — caching disabled gracefully if unavailable)
-REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
-REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
-redis_client = redis.StrictRedis(host=REDIS_HOST, port=REDIS_PORT, db=0)
-try:
-    redis_client.ping()
-    logging.info("Redis connected")
-except Exception:
-    redis_client = None
-    logging.warning("Redis not available — caching disabled")
+# Redis via Upstash (optional — caching disabled gracefully if unavailable)
+REDIS_URL = os.getenv('REDIS_URL')
+redis_client = None
+if REDIS_URL:
+    try:
+        redis_client = redis.from_url(REDIS_URL, socket_connect_timeout=3)
+        redis_client.ping()
+        logging.info("Redis (Upstash) connected")
+    except Exception:
+        redis_client = None
+        logging.warning("Redis not available — caching disabled")
+
+# Two-tier cache: L1 in-memory (fast, lost on restart) → L2 Upstash Redis (persistent)
+_memory_cache: TTLCache = TTLCache(maxsize=100, ttl=1800)
+_memory_cache_lock = threading.Lock()
 
 # Semantic models — loaded lazily on first use to reduce startup memory
 _embedding_model = None
@@ -391,6 +397,109 @@ _SYSTEM_PROMPT = (
     'say so clearly rather than guessing.'
 )
 
+_DECOMPOSE_PROMPT = (
+    'Split this question into independent sub-questions, each answerable from separate '
+    'document excerpts. If the question is simple, return just the original.\n'
+    'Rules: max 3 sub-questions, each self-contained.\n'
+    'Return ONLY a JSON array of strings, no explanation.\n\n'
+    'Question: {question}'
+)
+
+_GRADE_PROMPT = (
+    'Determine if each chunk is relevant to the query.\n'
+    'Return ONLY JSON: {{"relevant": [0, 2], "irrelevant": [1]}}\n'
+    '(numbers are 0-based chunk indices)\n\n'
+    'Query: {query}\nChunks:\n{chunks}'
+)
+
+_REFORMULATE_PROMPT = (
+    'Rewrite this query using different terminology that might appear in technical documents. '
+    'The original failed to retrieve relevant content.\n\n'
+    'Original: {query}\n'
+    'Rewritten query (return ONLY the query text):'
+)
+
+
+def _parse_llm_json(content):
+    """Strip markdown code fences then parse JSON. Raises ValueError on failure."""
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r'```(?:json)?\s*([\s\S]*?)```', content)
+    if m:
+        return json.loads(m.group(1).strip())
+    m = re.search(r'(\{[\s\S]*\}|\[[\s\S]*\])', content)
+    if m:
+        return json.loads(m.group(1))
+    raise ValueError(f"No JSON found in LLM output: {content[:200]}")
+
+
+def _call_groq_helper(user_content, max_tokens, temperature=0.0):
+    """Single-turn Groq call with Gemini fallback. Returns raw text or raises."""
+    try:
+        resp = groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{'role': 'user', 'content': user_content}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        logging.warning(f"Groq helper failed ({e}), trying Gemini")
+    if not GEMINI_API_KEY:
+        raise RuntimeError("Groq failed and no GEMINI_API_KEY configured")
+    model = genai.GenerativeModel(model_name=GEMINI_MODEL)
+    resp = model.generate_content(user_content)
+    return resp.text.strip()
+
+
+def decompose_query(question):
+    """Split complex question into sub-queries. Returns list of 1–3 strings.
+
+    Skips decomposition for short questions (<= 10 words) to save a Groq call.
+    """
+    if len(question.split()) <= 10:
+        return [question]
+    try:
+        raw = _call_groq_helper(_DECOMPOSE_PROMPT.format(question=question), max_tokens=200)
+        sub_queries = _parse_llm_json(raw)
+        if isinstance(sub_queries, list) and all(isinstance(q, str) for q in sub_queries):
+            result = [q.strip() for q in sub_queries[:3] if q.strip()]
+            return result or [question]
+    except Exception as e:
+        logging.warning(f"Query decomposition failed: {e}")
+    return [question]
+
+
+def grade_chunks(query, chunks):
+    """Grade chunks for relevance. Returns (relevant_texts, irrelevant_texts).
+
+    Falls back to treating all chunks as relevant on any failure.
+    """
+    if not chunks:
+        return [], []
+    formatted = '\n'.join(f'[{i}] {text[:300]}' for i, text in enumerate(chunks))
+    try:
+        raw = _call_groq_helper(_GRADE_PROMPT.format(query=query, chunks=formatted), max_tokens=150)
+        grades = _parse_llm_json(raw)
+        relevant_indices = {int(i) for i in grades.get('relevant', [])}
+        relevant = [chunks[i] for i in relevant_indices if i < len(chunks)]
+        irrelevant = [chunks[i] for i in range(len(chunks)) if i not in relevant_indices]
+        return relevant, irrelevant
+    except Exception as e:
+        logging.warning(f"Chunk grading failed: {e}")
+        return chunks, []
+
+
+def reformulate_query(query):
+    """Rewrite query for better retrieval. Returns rewritten string."""
+    try:
+        return _call_groq_helper(_REFORMULATE_PROMPT.format(query=query), max_tokens=100, temperature=0.1)
+    except Exception as e:
+        logging.warning(f"Query reformulation failed: {e}")
+        return query
+
 
 def generate_text(prompt, conversation_history=None):
     messages = [{'role': 'system', 'content': _SYSTEM_PROMPT}]
@@ -459,10 +568,84 @@ def ask_file(question, user_id, conversation_history=None):
     return response, sources
 
 
+def ask_file_agentic(question, user_id, conversation_history=None):
+    """Agentic RAG: query decomp + CRAG loop + synthesis. Falls back to ask_file() on error."""
+    try:
+        if get_collection_count(user_id) == 0:
+            return "No documents have been indexed yet. Please upload a PDF first.", []
+
+        sub_queries = decompose_query(question)
+        logging.info(f"[agentic] decomposed into {len(sub_queries)} sub-queries: {sub_queries}")
+
+        # Anchor retrieval to prior turn so follow-ups ("what about its revenue?")
+        # retrieve on full context, not just the bare pronoun.
+        prior_q = conversation_history[-1]['question'] if conversation_history else None
+
+        all_chunks = []
+        seen_texts = set()
+
+        for sub_q in sub_queries:
+            retrieval_query = f"{prior_q} {sub_q}" if prior_q else sub_q
+            scored = find_relevant_chunks(retrieval_query, user_id, top_n=5)
+            if not scored:
+                continue
+
+            texts = [text for _, text in scored]
+            relevant, _ = grade_chunks(sub_q, texts)
+
+            if not relevant:
+                logging.info(f"[agentic] no relevant chunks for '{retrieval_query}', reformulating")
+                retrieval_query = reformulate_query(retrieval_query)
+                scored = find_relevant_chunks(retrieval_query, user_id, top_n=5)
+                relevant = [text for _, text in scored]
+
+            for score, text in scored:
+                if text in seen_texts or text not in relevant:
+                    continue
+                seen_texts.add(text)
+                all_chunks.append((score, text))
+
+        if not all_chunks:
+            return "I couldn't find relevant information in your documents to answer this question.", []
+
+        sources = []
+        prompt = (
+            "Based on the following excerpts from documents, answer the question. "
+            "Include page numbers when citing information. "
+            "If the answer is not in the excerpts, say so.\n\n"
+        )
+        for score, text in sorted(all_chunks, key=lambda x: x[0], reverse=True)[:6]:
+            prompt += f"{text}\n\n"
+            m = re.match(r'^\[Page (\d+), Source: ([^\]]+)\]\s*(.*)', text, re.DOTALL)
+            if m:
+                sources.append({
+                    'page': int(m.group(1)),
+                    'source': m.group(2),
+                    'text': m.group(3).strip(),
+                    'score': round(score, 4),
+                })
+            else:
+                sources.append({'page': 0, 'source': 'unknown', 'text': text, 'score': round(score, 4)})
+
+        prompt += f"Question: {question}\nAnswer:"
+        response = generate_text(prompt, conversation_history=conversation_history)
+        if response is None:
+            return None, []
+        return response, sources
+
+    except Exception as e:
+        logging.error(f"[agentic] pipeline error, falling back to ask_file: {e}", exc_info=True)
+        return ask_file(question, user_id, conversation_history=conversation_history)
+
+
 # ---- Cache ----
 
 def get_cached_response(cache_key):
-    """Return (response, sources) from Redis, or (None, None) on miss/error."""
+    """Check L1 (in-memory) then L2 (Upstash Redis). Returns (response, sources) or (None, None)."""
+    with _memory_cache_lock:
+        hit = _memory_cache.get(cache_key)
+    if hit is not None:
+        return hit
     if not redis_client:
         return None, None
     try:
@@ -470,12 +653,17 @@ def get_cached_response(cache_key):
         if not cached:
             return None, None
         data = json.loads(cached)
-        return data.get('response'), data.get('sources', [])
+        result = (data.get('response'), data.get('sources', []))
+        with _memory_cache_lock:
+            _memory_cache[cache_key] = result
+        return result
     except Exception:
         return None, None
 
 
 def cache_response(cache_key, response, sources, ttl=3600):
+    with _memory_cache_lock:
+        _memory_cache[cache_key] = (response, sources)
     if not redis_client:
         return
     try:
@@ -650,7 +838,7 @@ def ask():
         from_cache = response is not None
 
         if response is None:
-            response, sources = ask_file(question, user_id, conversation_history=conversation_history)
+            response, sources = ask_file_agentic(question, user_id, conversation_history=conversation_history)
 
         if response is not None and 'No documents' not in response:
             if not from_cache and cache_key:
