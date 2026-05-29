@@ -14,6 +14,7 @@ import threading
 import uuid
 from dotenv import load_dotenv
 from groq import Groq
+import google.generativeai as genai
 from fastembed import TextEmbedding
 from fastembed.rerank.cross_encoder import TextCrossEncoder
 from qdrant_client import QdrantClient
@@ -30,6 +31,11 @@ app = Flask(__name__, static_url_path='', static_folder='.')
 # LLM via Groq (free tier)
 groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
 GROQ_MODEL = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
+
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
+GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.0-flash')
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 COLLECTION = 'documents'
 
@@ -222,9 +228,9 @@ def pdf_to_pages(path):
         return []
 
 
-def index_pdf(pdf_path, user_id, force=False):
+def index_pdf(pdf_path, user_id, force=False, display_name=None):
     """Extract, chunk, embed, and upsert a PDF into Qdrant for a specific user."""
-    filename = os.path.basename(pdf_path)
+    filename = display_name or os.path.basename(pdf_path)
 
     if force:
         qdrant.delete(
@@ -378,20 +384,20 @@ def find_relevant_chunks(query, user_id, top_n=3):
 
 # ---- LLM ----
 
+_SYSTEM_PROMPT = (
+    'You are a helpful assistant that answers questions based on '
+    'provided document excerpts. Always cite page numbers when referencing '
+    'information. If the answer is not found in the provided context, '
+    'say so clearly rather than guessing.'
+)
+
+
 def generate_text(prompt):
     try:
         response = groq_client.chat.completions.create(
             model=GROQ_MODEL,
             messages=[
-                {
-                    'role': 'system',
-                    'content': (
-                        'You are a helpful assistant that answers questions based on '
-                        'provided document excerpts. Always cite page numbers when referencing '
-                        'information. If the answer is not found in the provided context, '
-                        'say so clearly rather than guessing.'
-                    )
-                },
+                {'role': 'system', 'content': _SYSTEM_PROMPT},
                 {'role': 'user', 'content': prompt}
             ],
             max_tokens=750,
@@ -399,7 +405,17 @@ def generate_text(prompt):
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        logging.error(f"Groq API error: {e}", exc_info=True)
+        logging.warning(f"Groq failed, trying Gemini fallback: {e}")
+
+    if not GEMINI_API_KEY:
+        logging.error("Groq failed and no GEMINI_API_KEY configured")
+        return None
+    try:
+        model = genai.GenerativeModel(model_name=GEMINI_MODEL, system_instruction=_SYSTEM_PROMPT)
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        logging.error(f"Gemini fallback also failed: {e}", exc_info=True)
         return None
 
 
@@ -486,6 +502,7 @@ def upload_pdf():
     if not file.filename or not file.filename.lower().endswith('.pdf'):
         return jsonify({'error': 'Please upload a valid PDF file'}), 400
 
+    original_name = file.filename
     filename = secure_filename(file.filename)
     user_id = g.user_id
     storage_path = f"{user_id}/{filename}"
@@ -508,7 +525,7 @@ def upload_pdf():
         )
 
         # Index to Qdrant
-        count = index_pdf(tmp.name, user_id, force=True)
+        count = index_pdf(tmp.name, user_id, force=True, display_name=original_name)
         rebuild_bm25_for_user(user_id)
 
         # Upsert documents record in Supabase
