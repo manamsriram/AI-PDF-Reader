@@ -531,6 +531,12 @@ body {
   min-height: 16px;
 }
 
+.auth-verify { text-align: center; padding: 8px 0; }
+.auth-verify-icon { font-size: 40px; margin-bottom: 12px; }
+.auth-verify-heading { font-size: 18px; font-weight: 600; color: var(--text-primary); margin-bottom: 8px; }
+.auth-verify-body { font-size: 13px; color: var(--text-secondary); line-height: 1.5; margin-bottom: 20px; }
+.auth-verify-body strong { color: var(--text-primary); }
+
 /* ── Navbar additions ────────────────────────────────── */
 .history-toggle {
   background: none;

@@ -20,24 +20,46 @@
   <div class="auth-overlay" x-show="!authToken" x-cloak>
     <div class="auth-modal">
       <div class="auth-modal-title">DocSense AI</div>
-      <div class="auth-tabs">
-        <button class="auth-tab" :class="{ active: authMode === 'login' }" @click="authMode = 'login'; authError = ''">Sign In</button>
-        <button class="auth-tab" :class="{ active: authMode === 'signup' }" @click="authMode = 'signup'; authError = ''">Sign Up</button>
-      </div>
-      <div class="auth-error" x-show="authError" x-text="authError"></div>
-      <input class="auth-input" type="text" x-model="authName" placeholder="Full Name"
-             x-show="authMode === 'signup'"
-             @keydown.enter="signup()">
-      <input class="auth-input" type="email" x-model="authEmail" placeholder="Email"
-             @keydown.enter="authMode === 'login' ? login() : signup()">
-      <input class="auth-input" type="password" x-model="authPassword" placeholder="Password"
-             @keydown.enter="authMode === 'login' ? login() : signup()">
-      <input class="auth-input" type="password" x-model="authConfirmPassword" placeholder="Confirm Password"
-             x-show="authMode === 'signup'"
-             @keydown.enter="signup()">
-      <button class="auth-submit" @click="authMode === 'login' ? login() : signup()" :disabled="authLoading">
-        <span x-text="authLoading ? 'Please wait…' : (authMode === 'login' ? 'Sign In' : 'Create Account')"></span>
-      </button>
+
+      <!-- Verify email screen -->
+      <template x-if="authVerifyPending">
+        <div class="auth-verify">
+          <div class="auth-verify-icon">✉️</div>
+          <div class="auth-verify-heading">Check your email</div>
+          <div class="auth-verify-body">
+            We sent a confirmation link to <strong x-text="authEmail"></strong>.
+            Click it to activate your account, then sign in here.
+          </div>
+          <button class="auth-submit" @click="authVerifyPending = false; authMode = 'login'; authPassword = ''; authConfirmPassword = ''">
+            Back to Sign In
+          </button>
+        </div>
+      </template>
+
+      <!-- Login / Signup form -->
+      <template x-if="!authVerifyPending">
+        <div>
+          <div class="auth-tabs">
+            <button class="auth-tab" :class="{ active: authMode === 'login' }" @click="authMode = 'login'; authError = ''">Sign In</button>
+            <button class="auth-tab" :class="{ active: authMode === 'signup' }" @click="authMode = 'signup'; authError = ''">Sign Up</button>
+          </div>
+          <div class="auth-error" x-show="authError" x-text="authError"></div>
+          <input class="auth-input" type="text" x-model="authName" placeholder="Full Name"
+                 x-show="authMode === 'signup'"
+                 @keydown.enter="signup()">
+          <input class="auth-input" type="email" x-model="authEmail" placeholder="Email"
+                 @keydown.enter="authMode === 'login' ? login() : signup()">
+          <input class="auth-input" type="password" x-model="authPassword" placeholder="Password"
+                 @keydown.enter="authMode === 'login' ? login() : signup()">
+          <input class="auth-input" type="password" x-model="authConfirmPassword" placeholder="Confirm Password"
+                 x-show="authMode === 'signup'"
+                 @keydown.enter="signup()">
+          <button class="auth-submit" @click="authMode === 'login' ? login() : signup()" :disabled="authLoading">
+            <span x-text="authLoading ? 'Please wait…' : (authMode === 'login' ? 'Sign In' : 'Create Account')"></span>
+          </button>
+        </div>
+      </template>
+
     </div>
   </div>
 

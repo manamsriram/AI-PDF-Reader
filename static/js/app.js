@@ -17,6 +17,7 @@ document.addEventListener('alpine:init', () => {
     authPassword: '',
     authName: '',
     authConfirmPassword: '',
+    authVerifyPending: false,
     authError: '',
     authLoading: false,
 
@@ -102,7 +103,7 @@ document.addEventListener('alpine:init', () => {
           await this.loadDocuments();
           await this.loadHistory();
         } else {
-          this.authError = 'Check your email to confirm your account, then sign in.';
+          this.authVerifyPending = true;
         }
       } catch (e) {
         this.authError = 'Sign up failed. Please try again.';
