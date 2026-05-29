@@ -33,6 +33,12 @@ GROQ_MODEL = os.getenv('GROQ_MODEL', 'llama-3.3-70b-versatile')
 
 COLLECTION = 'documents'
 
+# Fail fast if required env vars are missing
+_required = ['SUPABASE_URL', 'SUPABASE_ANON_KEY', 'SUPABASE_SERVICE_KEY', 'GROQ_API_KEY', 'QDRANT_URL', 'QDRANT_API_KEY']
+_missing = [v for v in _required if not os.getenv(v)]
+if _missing:
+    raise EnvironmentError(f"Missing required environment variables: {', '.join(_missing)}")
+
 # Supabase clients
 supabase_anon: Client = create_client(os.getenv('SUPABASE_URL'), os.getenv('SUPABASE_ANON_KEY'))
 supabase_admin: Client = create_client(os.getenv('SUPABASE_URL'), os.getenv('SUPABASE_SERVICE_KEY'))
